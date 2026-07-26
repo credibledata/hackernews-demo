@@ -1,0 +1,260 @@
+// Hacker News — a semantic model over a curated slice of the public HN dataset.
+//
+// Two sources to query, both DuckDB-backed by local Parquet that
+// `prep/build-data.mjs` produced: `stories` (submissions — Ask HN, Show HN,
+// Jobs, and Links) and `comments`. A comment joins to the story at the root of
+// its thread via the `root_story_id` that prep resolved, so you can slice
+// comment activity by the story it belongs to, and a story joins forward to
+// every comment in its thread.
+//
+// Every source, dimension, measure, and view carries a #(doc) note. Those notes
+// are what an AI agent reads over MCP to ground itself — keep them accurate.
+//
+// Times are UTC.
+//
+// Two comment counts, which agree for most stories:
+//   `comment_count`   — total comments the story has on Hacker News right now.
+//   `thread_comments` — comment rows from that thread present in THIS slice.
+// They match exactly for about 85% of commented stories, and their totals agree
+// to within 0.1%. `thread_comments` runs lower when part of a thread falls
+// outside the window, and higher when comments were deleted on HN after this
+// slice ingested them. Use `comment_count` for "how much discussion did this
+// get"; use `thread_comments` when the comment rows themselves are being
+// filtered or grouped (by commenter, by hour, by length).
+//
+// Source-ordering note: Malloy resolves sources top-down, so a source cannot
+// reference one declared below it. `stories` and `comments` join to each other,
+// which is why `stories_base` exists — it is plumbing, not something to query.
+// Query `stories` and `comments`.
+
+// Shared chart palette so every view renders on-brand.
+## theme.palette.series = ["#ff6600", "#4f46e5", "#10b981", "#f59e0b", "#06b6d4", "#ec4899"]
+
+#(doc) Internal plumbing — the story table without its comment join, so `comments` has something to point at. Do not query this; use `stories`.
+source: stories_base is duckdb.table('data/stories.parquet') extend {
+  primary_key: id
+}
+
+#(doc) Hacker News comments — one row per comment, joined to the story at the root of its thread.
+source: comments is duckdb.table('data/comments.parquet') extend {
+  primary_key: id
+
+  join_one:
+    #(doc) The story at the root of this comment's thread (null if the story predates the loaded window)
+    story is stories_base on story.id = root_story_id
+
+  // Raw passthrough column `length` — comment length in characters (raw HTML).
+  dimension:
+    #(doc) Username of the commenter
+    author is `by`
+    #(doc) Hour of day the comment was posted, 0–23 UTC
+    post_hour is hour(time)
+
+  measure:
+    #(doc) Number of comments
+    comment_count is count()
+    #(doc) Number of distinct commenters
+    commenter_count is count(`by`)
+    #(doc) Average comment length in characters
+    # number="#,##0"
+    avg_length is length.avg()
+
+  #(doc) Most active commenters by comment count
+  view: top_commenters is {
+    where: author is not null
+    group_by: author
+    aggregate: comment_count, avg_length
+    order_by: comment_count desc
+    top: 15
+  }
+
+  #(doc) Comment volume by hour of day (UTC)
+  # line_chart
+  view: comments_by_hour is {
+    group_by: post_hour
+    aggregate: comment_count
+    order_by: post_hour
+  }
+
+  #(doc) Average comment length by the category of the story being discussed
+  # bar_chart
+  view: avg_length_by_category is {
+    where: story.category is not null
+    group_by: story.category
+    aggregate: comment_count, avg_length
+    order_by: comment_count desc
+  }
+}
+
+// Raw passthrough columns (queryable by name, self-descriptive):
+//   category  — submission kind: 'Ask HN', 'Show HN', 'Job', or 'Link'
+//   domain    — the URL's host, lowercased, with a leading "www." removed
+//               (e.g. 'github.com'). NOT collapsed to the registered domain:
+//               'gist.github.com' and 'matklad.github.io' are separate values.
+//               Null for text posts.
+//   title     — see the title-search note on the `title_words` dimension below
+//   score     — the story's HN points, re-read from the HN API when this slice
+//               was built. Jobs are never voted on and sit at 1. The upstream
+//               dataset ships an ingest-time snapshot instead, which understates
+//               by roughly 8x; prep/build-data.mjs replaces it (HN_REFRESH_SCORES).
+//   url
+#(doc) Hacker News submissions — one row per story or job post, keyed by `id`.
+source: stories is stories_base extend {
+  join_many:
+    #(doc) Every comment in this story's thread that is present in this slice
+    thread is comments on thread.root_story_id = id
+
+  dimension:
+    #(doc) Username of the submitter
+    author is `by`
+    #(doc) Total comments the story has on Hacker News now (the HN `descendants` count, re-read from the HN API at build time). Counts the whole thread, including replies posted after this slice's window closed.
+    comment_count is descendants
+    #(doc) Lowercased title. To find stories about a topic, match against THIS, not `title` — `title ~ '%GPT%'` is case-sensitive and would miss 'gpt'. Prefer a word-boundary regex over a bare substring: `title_words ~ r'\bgpt\b'` finds GPT but not "gpt-ish" inside another word, whereas `title_words ~ '%rust%'` also matches "trust" and "crusty".
+    title_words is lower(title)
+    #(doc) Hour of day the story was posted, 0–23 UTC
+    post_hour is hour(time)
+    #(doc) Day of week the story was posted, 1=Sunday … 7=Saturday (UTC)
+    post_dow is day_of_week(time)
+    #(doc) Calendar year the story was posted
+    # number="0"
+    post_year is year(time)
+    #(doc) Month the story was posted, truncated to the first of the month
+    post_month is time.month
+    #(doc) Score bucket, for looking at the distribution of story success
+    score_tier is
+      pick '1. <5' when score < 5
+      pick '2. 5–19' when score < 20
+      pick '3. 20–99' when score < 100
+      pick '4. 100–499' when score < 500
+      else '5. 500+'
+
+  measure:
+    #(doc) Number of stories
+    story_count is count()
+    #(doc) Sum of all story scores
+    total_score is score.sum()
+    #(doc) Average story score
+    # number="#,##0.0"
+    avg_score is score.avg()
+    #(doc) Highest score in the group
+    max_score is score.max()
+    #(doc) Average comments per story, over the whole HN thread
+    # number="#,##0.0"
+    avg_comments is descendants.avg()
+    #(doc) Comments from these stories' threads that are present in this slice. Use `count(thread.id)`, never `thread.count()` — the latter also counts the empty join row for every story that has no comments here.
+    thread_comments is count(thread.id)
+    #(doc) Average comments per story counted from the comment rows in this slice
+    # number="#,##0.0"
+    avg_thread_comments is count(thread.id) / count()
+    #(doc) Number of distinct submitters
+    author_count is count(`by`)
+
+  // ── Reusable views ──────────────────────────────────────────────────
+  #(doc) Top domains by average score (min 20 stories), highest first
+  view: top_domains is {
+    where: domain is not null
+    group_by: domain
+    aggregate: avg_score, story_count, total_score
+    having: story_count >= 20
+    order_by: avg_score desc
+    top: 15
+  }
+
+  #(doc) Story volume and average score by hour of day — the "best time to post"
+  # line_chart
+  view: score_by_hour is {
+    group_by: post_hour
+    aggregate: story_count, avg_score
+    order_by: post_hour
+  }
+
+  #(doc) Story volume and average score by day of week
+  # bar_chart
+  view: score_by_dow is {
+    group_by: post_dow
+    aggregate: story_count, avg_score
+    order_by: post_dow
+  }
+
+  #(doc) Story counts by submission category
+  # bar_chart
+  view: by_category is {
+    group_by: category
+    aggregate: story_count, avg_score
+    order_by: story_count desc
+  }
+
+  #(doc) Monthly story volume over time
+  # line_chart
+  view: stories_per_month is {
+    group_by: post_month
+    aggregate: story_count
+    order_by: post_month
+  }
+
+  #(doc) Monthly volume of Ask HN vs Show HN (one line per category)
+  # line_chart
+  view: ask_vs_show_over_time is {
+    where: category = 'Ask HN' or category = 'Show HN'
+    group_by: post_month, category
+    aggregate: story_count
+    order_by: post_month
+  }
+
+  #(doc) Most prolific submitters by story count, with their average score
+  view: top_authors is {
+    where: author is not null
+    group_by: author
+    aggregate: story_count, avg_score, total_score
+    order_by: story_count desc
+    top: 15
+  }
+
+  #(doc) The most-discussed stories, by total comments on Hacker News
+  view: most_discussed is {
+    group_by: title, author, score
+    aggregate:
+      #(doc) Total comments on HN
+      comments is comment_count.max()
+      #(doc) How many of those comments are in this slice
+      comments_here is thread_comments
+    order_by: comments desc
+    top: 15
+  }
+
+  #(doc) How story scores are distributed across score buckets
+  # bar_chart
+  view: score_distribution is {
+    group_by: score_tier
+    aggregate: story_count
+    order_by: score_tier
+  }
+
+  // ── Dashboard: KPIs + trend + breakdowns in one query ───────────────
+  #(doc) Overview: headline KPIs, monthly trend, top domains, and category mix
+  # dashboard
+  view: hn_overview is {
+    nest:
+      # big_value
+      kpis is {
+        aggregate:
+          # label="Stories"
+          story_count
+          # label="Avg score"
+          # number="#,##0.0"
+          avg_score
+          # label="Avg comments"
+          # number="#,##0.0"
+          avg_comments
+          # label="Comments here"
+          thread_comments
+          # label="Submitters"
+          author_count
+      }
+    nest:
+      stories_per_month
+      top_domains
+      by_category
+      score_by_hour
+  }
+}

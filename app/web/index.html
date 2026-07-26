@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ask Hacker News — Malloy + Publisher</title>
+    <meta
+      name="description"
+      content="Ask questions about Hacker News in plain English. An agent queries a governed Malloy semantic model over MCP, and every answer shows the Malloy query and generated SQL behind it."
+    />
+
+    <!-- Orange "Y" tile, inline so it costs no request. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff6600'/%3E%3Ctext x='16' y='23' font-family='Helvetica,Arial,sans-serif' font-size='21' font-weight='bold' fill='white' text-anchor='middle'%3EY%3C/text%3E%3C/svg%3E"
+    />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Ask Hacker News — a Malloy + Publisher demo" />
+    <meta
+      property="og:description"
+      content="Plain-English questions answered from a governed Malloy semantic model, with the query and SQL behind every number."
+    />
+    <!-- Relative path: the deploy host isn't known at build time, so scrapers
+         resolve this against the page's own origin. -->
+    <meta property="og:image" content="/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="Ask Hacker News — plain-English questions answered from a Malloy semantic model, showing the Malloy query run: stories -> top_domains"
+    />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Ask Hacker News — a Malloy + Publisher demo" />
+    <meta
+      name="twitter:description"
+      content="Plain-English questions answered from a governed Malloy semantic model, with the query and SQL behind every number."
+    />
+    <meta name="twitter:image" content="/og.png" />
+
+    <meta name="theme-color" content="#f6f6ef" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)" />
+
+    <script>
+      // Apply the saved theme before first paint, otherwise a dark-mode user
+      // gets a white flash while the bundle loads.
+      try {
+        var t = localStorage.getItem('hn-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

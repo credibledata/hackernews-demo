@@ -1,0 +1,12 @@
+{
+  "frozenConfig": false,
+  "environments": [
+    {
+      "name": "hn",
+      "packages": [
+        { "name": "hacker-news", "location": "./package" }
+      ],
+      "connections": []
+    }
+  ]
+}

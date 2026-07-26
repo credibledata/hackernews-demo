@@ -1,0 +1,15 @@
+{
+  "name": "hn-chat-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chat backend: an MCP client to Malloy Publisher that drives an OpenAI model.",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.19.1",
+    "express": "^5.1.0",
+    "openai": "^4.104.0"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "hacker-news",
+  "version": "0.1.0",
+  "description": "Hacker News analytics — a Malloy semantic model over a curated slice of the public HN dataset, served for AI-over-MCP exploration."
+}

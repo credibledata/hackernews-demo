@@ -1,0 +1,348 @@
+// Build the curated Hacker News Parquet slice the Malloy model reads.
+//
+// Reads the open-index/hacker-news dataset (Parquet on Hugging Face, one file
+// per month) for a configurable lookback window, splits it into `stories` and
+// `comments`, derives a few fields that are expensive to compute at query time
+// (domain, category, and each comment's root story id), and writes two local
+// Parquet files.
+//
+// Config (env, read by the CLI at the bottom):
+//   HN_MONTHS  how many months back from HN_END          (default 12)
+//   HN_END     last month to include, "YYYY-MM"          (default: latest available)
+//   HN_TYPES   item types to keep, comma-separated        (default 1,2,5)
+//   HN_OUT     output directory                           (default ./package/data)
+//   HN_REFRESH_SCORES        set to 0 to skip the live score refresh (default on)
+//   HN_REFRESH_CONCURRENCY   in-flight HN API requests     (default 50)
+//
+// The score refresh matters: the upstream dataset freezes `score` and
+// `descendants` at ingest, so without it every score-based aggregate measures
+// the first minutes after posting rather than the story's actual reception.
+//
+// The ETL (`buildData`) takes an explicit list of source files, so it runs the
+// same whether the source is Hugging Face or a local fixture — which is what the
+// tests use.
+
+import { DuckDBInstance, quotedString } from '@duckdb/node-api';
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+
+const HF_GLOB = 'hf://datasets/open-index/hacker-news/data/*/*.parquet';
+const MONTH_RE = /(\d{4})-(\d{2})\.parquet$/;
+
+/** Open a DuckDB connection with httpfs loaded (needed for hf:// reads). */
+export async function openConnection() {
+  const instance = await DuckDBInstance.create(':memory:');
+  const con = await instance.connect();
+  await con.run('INSTALL httpfs; LOAD httpfs;');
+  return con;
+}
+
+const monthIndex = (m) => {
+  const [y, mo] = m.split('-').map(Number);
+  return y * 12 + (mo - 1);
+};
+
+/**
+ * List the Hugging Face monthly files that fall inside the lookback window.
+ * Globs the dataset (a metadata call, not a data download), so a month that
+ * doesn't exist yet is simply absent rather than a hard error.
+ */
+export async function resolveSourceFiles(con, { months = 12, end } = {}) {
+  const reader = await con.runAndReadAll(
+    `SELECT file FROM glob(${quotedString(HF_GLOB)}) ORDER BY file`
+  );
+  const available = reader
+    .getRows()
+    .map((row) => String(row[0]))
+    .map((file) => ({ file, month: (file.match(MONTH_RE) || [])[0]?.replace('.parquet', '') }))
+    .filter((x) => x.month)
+    .sort((a, b) => a.month.localeCompare(b.month));
+
+  if (available.length === 0) {
+    throw new Error(`No dataset files found at ${HF_GLOB}`);
+  }
+  const endMonth = end || available[available.length - 1].month;
+  const endIdx = monthIndex(endMonth);
+  const startIdx = endIdx - (months - 1);
+  const picked = available.filter((x) => {
+    const idx = monthIndex(x.month);
+    return idx >= startIdx && idx <= endIdx;
+  });
+  if (picked.length === 0) {
+    throw new Error(`No files in window ${months}mo ending ${endMonth}`);
+  }
+  return { files: picked.map((x) => x.file), endMonth, startMonth: picked[0].month };
+}
+
+/** Build a `read_parquet([...])` expression from a list of file paths/urls. */
+const readParquetExpr = (files) =>
+  `read_parquet([${files.map(quotedString).join(', ')}], union_by_name = true)`;
+
+const HN_ITEM_URL = (id) => `https://hacker-news.firebaseio.com/v0/item/${id}.json`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Re-read `score` and `descendants` from the HN API and write the current
+ * values back into `items`.
+ *
+ * The upstream dataset snapshots both fields at (or shortly after) ingest and
+ * never refreshes them, so they measure the first few minutes of a story's life
+ * rather than its eventual reception — badly enough to invert any ranking built
+ * on them. One well-discussed story in a recent slice carried score 368 /
+ * descendants 231 against live values of 1561 / 1113.
+ *
+ * Only stories and jobs (type 1 and 5) are fetched; comments carry neither
+ * field. Items the API no longer knows about (deleted since ingest) keep their
+ * original values — a stale number beats an invented one.
+ */
+export async function refreshLiveScores(
+  con,
+  {
+    fetchImpl = fetch,
+    concurrency = Number(process.env.HN_REFRESH_CONCURRENCY || 50),
+    retries = 3,
+    retryDelayMs = 250,
+    maxFailureRate = 0.05,
+    onProgress,
+  } = {}
+) {
+  const ids = (await con.runAndReadAll(`SELECT id FROM items WHERE type IN (1, 5) ORDER BY id`))
+    .getRows()
+    .map((r) => Number(r[0]));
+  if (ids.length === 0) return { fetched: 0, updated: 0, missing: 0, failed: 0 };
+
+  const live = [];
+  let missing = 0;
+  let failed = 0;
+  let done = 0;
+  let cursor = 0;
+
+  // A fixed pool of workers pulling from one cursor: keeps exactly `concurrency`
+  // requests in flight without materialising 80k promises up front.
+  const worker = async () => {
+    for (let i = cursor++; i < ids.length; i = cursor++) {
+      const id = ids[i];
+      let item;
+      let ok = false;
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+          const res = await fetchImpl(HN_ITEM_URL(id));
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          item = await res.json();
+          ok = true;
+          break;
+        } catch {
+          if (attempt < retries) await sleep(retryDelayMs * 2 ** attempt);
+        }
+      }
+      if (!ok) failed++;
+      else if (!item) missing++;
+      else live.push([id, item.score, item.descendants]);
+      if (onProgress && ++done % 5000 === 0) onProgress(done, ids.length);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, ids.length) }, worker));
+
+  // Publishing a slice that is mostly stale is worse than not publishing: the
+  // numbers would still look authoritative. Fail the build instead.
+  if (failed / ids.length > maxFailureRate) {
+    throw new Error(
+      `live score refresh failed for ${failed}/${ids.length} items ` +
+        `(over the ${(maxFailureRate * 100).toFixed(0)}% tolerance) — refusing to write partly-stale data`
+    );
+  }
+
+  await con.run(`CREATE OR REPLACE TEMP TABLE live_scores (id BIGINT, score INTEGER, descendants INTEGER);`);
+  const num = (v) => (Number.isFinite(v) ? v : 'NULL');
+  for (let i = 0; i < live.length; i += 1000) {
+    const values = live
+      .slice(i, i + 1000)
+      .map(([id, s, d]) => `(${id}, ${num(s)}, ${num(d)})`)
+      .join(', ');
+    await con.run(`INSERT INTO live_scores VALUES ${values};`);
+  }
+  // coalesce, not straight assignment: a story the API returns without a score
+  // should keep the one we already had rather than go null.
+  await con.run(`
+    UPDATE items SET
+      score       = coalesce(l.score, items.score),
+      descendants = coalesce(l.descendants, items.descendants)
+    FROM live_scores l
+    WHERE items.id = l.id;
+  `);
+
+  return { fetched: ids.length, updated: live.length, missing, failed };
+}
+
+/**
+ * Split, clean, and enrich the source files into stories.parquet and
+ * comments.parquet under `outDir`. Returns row counts and the share of comments
+ * whose root story resolved (comments rooted before the window resolve to null).
+ *
+ * `refreshScores` opts into the live HN score/comment refresh described above.
+ * It defaults off so the ETL — and its tests — stay hermetic; the CLI turns it
+ * on.
+ */
+export async function buildData(
+  con,
+  { sourceFiles, outDir, types = [1, 2, 5], refreshScores = false, fetchImpl, onProgress } = {}
+) {
+  if (!sourceFiles?.length) throw new Error('buildData: sourceFiles is required');
+  await mkdir(outDir, { recursive: true });
+  const storiesPath = path.join(outDir, 'stories.parquet');
+  const commentsPath = path.join(outDir, 'comments.parquet');
+  const src = readParquetExpr(sourceFiles);
+  const typeList = types.join(', ');
+
+  // One working table: live items in the window, heavy columns dropped.
+  await con.run(`
+    CREATE OR REPLACE TABLE items AS
+    SELECT
+      id,
+      type,
+      "by"          AS author,
+      time,
+      parent,
+      url,
+      score,
+      title,
+      descendants,
+      length(text)  AS text_len
+    FROM ${src}
+    WHERE coalesce(deleted, 0) = 0
+      AND coalesce(dead, 0) = 0
+      AND type IN (${typeList});
+  `);
+
+  // Before anything is written: replace the ingest-time score/comment snapshots
+  // with current values, so every downstream aggregate measures reception
+  // rather than the first few minutes after posting.
+  const refreshed = refreshScores
+    ? await refreshLiveScores(con, { fetchImpl, onProgress })
+    : null;
+
+  // Stories (and jobs): derive domain and a human category.
+  await con.run(`
+    COPY (
+      SELECT
+        id,
+        author AS "by",
+        time,
+        score,
+        descendants,
+        title,
+        url,
+        nullif(regexp_extract(lower(coalesce(url, '')), '://(?:www\\.)?([^/]+)', 1), '') AS domain,
+        CASE
+          WHEN type = 5                THEN 'Job'
+          WHEN title ILIKE 'Ask HN:%'  THEN 'Ask HN'
+          WHEN title ILIKE 'Show HN:%' THEN 'Show HN'
+          ELSE 'Link'
+        END AS category
+      FROM items
+      WHERE type IN (1, 5)
+      ORDER BY id
+    ) TO ${quotedString(storiesPath)} (FORMAT parquet, COMPRESSION zstd);
+  `);
+
+  // Resolve each comment's root story by climbing the parent chain. A comment
+  // whose ancestor story is outside the window drops out of the join and gets a
+  // null root_story_id downstream.
+  await con.run(`
+    CREATE OR REPLACE TABLE root_map AS
+    WITH RECURSIVE walk(comment_id, cur, depth) AS (
+      SELECT id, parent, 1 FROM items WHERE type = 2
+      UNION ALL
+      SELECT w.comment_id, i.parent, w.depth + 1
+      FROM walk w JOIN items i ON w.cur = i.id
+      WHERE i.type = 2 AND w.depth < 50
+    )
+    SELECT comment_id, cur AS root_story_id
+    FROM walk w
+    JOIN items i ON w.cur = i.id
+    WHERE i.type IN (1, 5)
+    QUALIFY row_number() OVER (PARTITION BY comment_id ORDER BY depth) = 1;
+  `);
+
+  await con.run(`
+    COPY (
+      SELECT
+        i.id,
+        i.author AS "by",
+        i.time,
+        i.parent,
+        rm.root_story_id,
+        i.text_len AS length
+      FROM items i
+      LEFT JOIN root_map rm ON i.id = rm.comment_id
+      WHERE i.type = 2
+      ORDER BY i.id
+    ) TO ${quotedString(commentsPath)} (FORMAT parquet, COMPRESSION zstd);
+  `);
+
+  const stats = (
+    await con.runAndReadAll(`
+      SELECT
+        (SELECT count(*) FROM items WHERE type IN (1,5))                                    AS stories,
+        (SELECT count(*) FROM items WHERE type = 2)                                         AS comments,
+        (SELECT count(*) FROM root_map)                                                     AS resolved
+    `)
+  ).getRowObjects()[0];
+
+  const stories = Number(stats.stories);
+  const comments = Number(stats.comments);
+  const resolved = Number(stats.resolved);
+  return {
+    stories,
+    comments,
+    resolved,
+    resolutionRate: comments === 0 ? 1 : resolved / comments,
+    refreshed,
+    storiesPath,
+    commentsPath,
+  };
+}
+
+// ── CLI ────────────────────────────────────────────────────────────────────
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  const months = Number(process.env.HN_MONTHS || 12);
+  const end = process.env.HN_END || undefined;
+  const types = (process.env.HN_TYPES || '1,2,5').split(',').map((t) => Number(t.trim()));
+  const outDir = process.env.HN_OUT || path.resolve('package/data');
+
+  const con = await openConnection();
+  console.log(`[prep] resolving window: ${months} month(s)${end ? ` ending ${end}` : ' ending latest'}`);
+  const { files, startMonth, endMonth } = await resolveSourceFiles(con, { months, end });
+  console.log(`[prep] window ${startMonth}..${endMonth} — ${files.length} monthly file(s)`);
+  console.log('[prep] building (downloads + ETL; this can take a while on wide windows)…');
+  const t0 = Date.now();
+  const refreshScores = process.env.HN_REFRESH_SCORES !== '0';
+  if (refreshScores) console.log('[prep] will refresh scores/comment counts from the HN API');
+  const stats = await buildData(con, {
+    sourceFiles: files,
+    outDir,
+    types,
+    refreshScores,
+    onProgress: (done, total) => console.log(`[prep]   live refresh ${done}/${total}`),
+  });
+  // Marker the container entrypoint reads to decide whether to re-fetch on boot.
+  await writeFile(path.join(outDir, '.window'), `${months}:${end || 'latest'}\n`);
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(
+    `[prep] done in ${secs}s → ${outDir}\n` +
+      `[prep]   stories:  ${stats.stories.toLocaleString()}\n` +
+      `[prep]   comments: ${stats.comments.toLocaleString()} ` +
+      `(root story resolved: ${(stats.resolutionRate * 100).toFixed(1)}%)` +
+      (stats.refreshed
+        ? `\n[prep]   live scores: ${stats.refreshed.updated.toLocaleString()} refreshed, ` +
+          `${stats.refreshed.missing.toLocaleString()} gone from the API, ${stats.refreshed.failed} failed`
+        : '\n[prep]   live scores: skipped (HN_REFRESH_SCORES=0) — scores are ingest-time snapshots')
+  );
+  if (stats.comments > 0 && stats.resolutionRate < 0.5) {
+    console.warn(
+      `[prep] WARNING: low root-story resolution (${(stats.resolutionRate * 100).toFixed(1)}%). ` +
+        `Many comments reference stories older than the window — widen HN_MONTHS for denser joins.`
+    );
+  }
+}

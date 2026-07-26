@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.local
+publisher_data/
+publisher.db*
+package/data/*.parquet
+app/*/dist/
+app/*/node_modules/
+*.tsbuildinfo
+.cache/

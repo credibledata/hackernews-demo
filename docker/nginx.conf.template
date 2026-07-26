@@ -1,0 +1,83 @@
+user root;
+worker_processes 1;
+error_log /dev/stderr warn;
+pid /run/nginx.pid;
+
+events { worker_connections 1024; }
+
+http {
+  include /etc/nginx/mime.types;
+  default_type application/octet-stream;
+  access_log /dev/stdout;
+  sendfile on;
+
+  # Admission control for the two endpoints that reach Publisher directly.
+  # /chat/ is limited in the Node backend instead (it needs to distinguish a
+  # rate rejection from a saturation one); these two would otherwise run
+  # unmetered DuckDB queries for anyone who found them.
+  #
+  # The key is the direct peer. If you deploy behind an external load balancer,
+  # every request arrives from the balancer and these become global limits —
+  # see "Limiting chat cost" in the README.
+  limit_req_zone  $binary_remote_addr zone=hn_api:10m rate=__API_RATE__;
+  limit_req_zone  $binary_remote_addr zone=hn_mcp:10m rate=__MCP_RATE__;
+  limit_conn_zone $binary_remote_addr zone=hn_conn:10m;
+
+  # Match the 429 the chat endpoint returns; nginx would otherwise say 503.
+  limit_req_status  429;
+  limit_conn_status 429;
+
+  server {
+    listen __PORT__;
+    root /app/web;
+    index index.html;
+
+    # Chat backend — SSE, so no buffering and a long read timeout.
+    location /chat/ {
+      proxy_pass http://127.0.0.1:8787;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      # Without these the backend only ever sees nginx's loopback address, and
+      # its per-IP rate limiter degrades into a single shared bucket. nginx
+      # appends the real peer as the last entry, so a spoofed header can't
+      # displace it (the backend trusts only the loopback hop).
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_buffering off;
+      proxy_cache off;
+      proxy_read_timeout 600s;
+    }
+
+    # Publisher REST + Explorer API.
+    location /api/ {
+      limit_req  zone=hn_api burst=__API_BURST__ nodelay;
+      limit_conn hn_conn __CONN_LIMIT__;
+      proxy_pass http://127.0.0.1:4000;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_read_timeout 300s;
+    }
+
+    # Publisher MCP endpoint — external agents connect here (streamable HTTP).
+    # A single agent turn is several tool calls, so this needs more burst
+    # headroom than the REST path, and the connection cap has to stay loose
+    # enough not to sever a live session mid-turn.
+    location /mcp {
+      limit_req  zone=hn_mcp burst=__MCP_BURST__ nodelay;
+      limit_conn hn_conn __CONN_LIMIT__;
+      proxy_pass http://127.0.0.1:4040/mcp;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_buffering off;
+      proxy_cache off;
+      proxy_read_timeout 600s;
+    }
+
+    # Static single-page UI.
+    location / {
+      try_files $uri /index.html;
+    }
+  }
+}

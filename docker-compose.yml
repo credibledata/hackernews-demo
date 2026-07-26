@@ -1,0 +1,21 @@
+# Local run: builds the image (baking a small default window for a quick start),
+# and serves everything on http://localhost:8080.
+#
+#   OPENAI_API_KEY=sk-... docker compose up --build
+#
+# Override the data window without a rebuild by setting HN_MONTHS / HN_END and
+# HN_REFETCH=1 (the container re-fetches from Hugging Face on boot).
+services:
+  app:
+    build:
+      context: .
+      args:
+        HN_MONTHS: "3"          # small default for a fast local build; bump for more history
+    ports:
+      - "8080:8080"             # single fronted port (UI + /chat + /api + /mcp)
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+      PORT: "8080"
+      # HN_MONTHS: "6"          # uncomment + HN_REFETCH=1 to change the window on boot
+      # HN_END: "2026-06"
+      # HN_REFETCH: "1"

@@ -1,0 +1,20 @@
+{
+  "name": "hn-malloy-publisher-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hacker News analytics demo for Malloy + Malloy Publisher (AI over MCP).",
+  "license": "MIT",
+  "scripts": {
+    "prep": "node prep/build-data.mjs",
+    "test:prep": "node --test tests/prep.test.mjs",
+    "serve": "PUBLISHER_WATCH=hn npx -y @malloy-publisher/server --port 4000 --host 127.0.0.1",
+    "test": "node --test tests/*.test.mjs",
+    "test:browser": "node tests/browser/run.mjs",
+    "smoke": "node tests/smoke-chat.mjs",
+    "refresh": "node prep/refresh.mjs"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.3.4-alpha.27"
+  }
+}

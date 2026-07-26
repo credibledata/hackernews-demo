@@ -1,0 +1,8 @@
+# Public demo — crawling the UI is fine.
+# The API and MCP endpoints are for agents you point at them deliberately, not
+# for crawlers: they run real queries and are rate limited.
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /mcp
+Disallow: /chat/

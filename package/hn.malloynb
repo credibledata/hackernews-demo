@@ -1,0 +1,58 @@
+>>>markdown
+# Hacker News — a guided tour
+
+A curated slice of the public Hacker News dataset, modeled in Malloy. Two
+sources — `stories` (submissions) and `comments` (joined to the story at the root
+of each thread) — with reusable, documented measures and chart-tagged views. Open
+[`hn.malloy`](hn.malloy) to see how they're defined.
+
+Times are UTC; scores are point-in-time snapshots.
+>>>malloy
+import "hn.malloy"
+>>>markdown
+## Overview
+
+One `# dashboard` view, one query: KPI tiles plus the monthly trend, top domains,
+category mix, and volume by hour.
+>>>malloy
+run: stories -> hn_overview
+>>>markdown
+## Which domains do well?
+
+Average score by domain, for domains with at least 20 stories.
+>>>malloy
+run: stories -> top_domains
+>>>markdown
+## When should you post?
+
+Story volume and average score by hour of day (UTC). The two tell different
+stories — the busiest hours aren't the highest-scoring ones.
+>>>malloy
+run: stories -> score_by_hour
+>>>markdown
+## Ask HN vs Show HN over time
+
+Monthly volume, one line per category.
+>>>malloy
+run: stories -> ask_vs_show_over_time
+>>>markdown
+## How rare is a hit?
+
+The distribution of story scores across buckets — most stories never take off.
+>>>malloy
+run: stories -> score_distribution
+>>>markdown
+## The most-discussed stories
+>>>malloy
+run: stories -> most_discussed
+>>>markdown
+## Crossing the join: comments by the story they're on
+
+`comments` joins to `stories` via each comment's resolved root story, so we can
+group comment activity by the category of the story being discussed.
+>>>malloy
+run: comments -> avg_length_by_category
+>>>markdown
+## Who comments the most?
+>>>malloy
+run: comments -> top_commenters
