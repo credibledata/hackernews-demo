@@ -1,0 +1,10 @@
+**/node_modules
+**/dist
+package/data
+publisher_data
+publisher.db*
+docs
+.git
+*.log
+.DS_Store
+.env
