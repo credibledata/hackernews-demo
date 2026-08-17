@@ -1,13 +1,16 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
+const devPort = Number(process.env.HN_WEB_PORT || 5173);
+const chatTarget = process.env.HN_CHAT_PROXY || 'http://127.0.0.1:8787';
+
 // In dev, proxy the chat backend so the browser talks to one origin.
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5173,
+    port: devPort,
     proxy: {
-      '/chat': { target: 'http://127.0.0.1:8787', changeOrigin: true },
+      '/chat': { target: chatTarget, changeOrigin: true },
       // Publisher REST — used by the Explorer and the render-check harness.
       '/api': { target: 'http://127.0.0.1:4000', changeOrigin: true },
     },

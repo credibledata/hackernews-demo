@@ -112,6 +112,63 @@ const fakeApi = (live) => async (url) => {
   return { ok: true, json: async () => (live[id] ? { id, ...live[id] } : null) };
 };
 
+// The Hugging Face files are partitioned by UTC month, but the model buckets in
+// Pacific — so the first hours of the window's first UTC day belong to the
+// PREVIOUS Pacific month, and every monthly view grows a phantom leading bucket
+// holding a few hours of data. Trim the window to whole Pacific months instead.
+test('buildData trims the window to whole months in the model timezone', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hn-prep-tz-'));
+  const con = await openConnection();
+  try {
+    // 08:00Z on Jan 1 is exactly 2024-01-01 00:00 Pacific (PST, UTC-8) — the
+    // first instant of the window. 03:00Z is 2023-12-31 19:00 Pacific: inside
+    // the January UTC file, but a December story to anyone reading in Pacific.
+    const story = (id, by, at, title) =>
+      `(${id}, 0, 1, '${by}', TIMESTAMPTZ '${at}', CAST(NULL AS VARCHAR), 0, NULL,` +
+      ` CAST(NULL AS VARCHAR), 10, '${title}', 0)`;
+    const rows = `
+      VALUES
+        ${story(1, 'early', '2024-01-01 03:00:00+00', 'Dec in Pacific')},
+        ${story(2, 'ontime', '2024-01-01 08:00:00+00', 'Jan boundary')},
+        ${story(3, 'later', '2024-01-05 12:00:00+00', 'Mid January')}
+    `;
+    const fixture = path.join(dir, 'fixture.parquet');
+    await con.run(
+      `COPY (SELECT * FROM (${rows}) AS t${FIXTURE_COLS}) TO ${quotedString(fixture)} (FORMAT parquet);`
+    );
+
+    const trimmed = await buildData(con, {
+      sourceFiles: [fixture],
+      outDir: path.join(dir, 'trimmed'),
+      startMonth: '2024-01',
+    });
+    assert.equal(trimmed.stories, 2, 'the pre-window Pacific story should be dropped');
+
+    // Without a startMonth the window is untrimmed — callers that pass explicit
+    // files (like the tests above) must keep every row they handed in.
+    const untrimmed = await buildData(con, {
+      sourceFiles: [fixture],
+      outDir: path.join(dir, 'untrimmed'),
+    });
+    assert.equal(untrimmed.stories, 3, 'no startMonth means no trimming');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildData rejects a startMonth it cannot trust in SQL', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hn-prep-bad-'));
+  const con = await openConnection();
+  try {
+    await assert.rejects(
+      buildData(con, { sourceFiles: ['x.parquet'], outDir: dir, startMonth: "2024-01'; DROP" }),
+      /startMonth/
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('refreshLiveScores replaces frozen scores with current ones', async () => {
   const con = await openConnection();
   try {

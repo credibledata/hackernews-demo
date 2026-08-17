@@ -8,7 +8,7 @@
   "scripts": {
     "prep": "node prep/build-data.mjs",
     "test:prep": "node --test tests/prep.test.mjs",
-    "serve": "PUBLISHER_WATCH=hn npx -y @malloy-publisher/server --port 4000 --host 127.0.0.1",
+    "serve": "PUBLISHER_WATCH=hn npx -y @malloy-publisher/server@0.0.246 --port 4000 --host 127.0.0.1",
     "test": "node --test tests/*.test.mjs",
     "test:browser": "node tests/browser/run.mjs",
     "smoke": "node tests/smoke-chat.mjs",

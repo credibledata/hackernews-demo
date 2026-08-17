@@ -2,8 +2,8 @@
 // tool loop over the Publisher MCP tools. The Responses API is used (rather than
 // chat.completions) because the newer reasoning models require it to combine
 // reasoning with function tools. Emits text deltas and tool-call notifications
-// through callbacks, and records the Malloy query the model ran so the caller can
-// show it (and its compiled SQL) in the UI.
+// through callbacks, and records every tool call it made — the trace the caller
+// turns into the "under the hood" panel.
 
 import OpenAI from 'openai';
 import { config } from './config.mjs';
@@ -55,11 +55,11 @@ Use the tools extensively. A good turn uses several tool calls before answering:
          aggregate: avg_score, max_score, story_count
          where: title ~ '%GPT%' or title ~ '%Claude%'
        }
-   Never run one filtered query per group. Only the last query you run is shown
-   to the user, so N queries means N-1 groups vanish and the survivor arrives
-   with no label saying which group it is. A grouped query is also the more
-   correct answer: overlapping members (a title naming both) land in exactly one
-   bucket instead of being counted twice.
+   Never run one filtered query per group. The chart and the answer rest on a
+   single result, so one query per group leaves the reader comparing numbers
+   that arrive with no label saying which group they belong to. A grouped query
+   is also the more correct answer: overlapping members (a title naming both)
+   land in exactly one bucket instead of being counted twice.
 
 6. RUN — call malloy_executeQuery. Always pass a full "query" string (not a
    queryName) so the query is visible to the user.
@@ -72,7 +72,8 @@ Use the tools extensively. A good turn uses several tool calls before answering:
 You have a budget of about 15 tool calls per question. Spend it on queries:
 don't repeat a discovery or docs call that you already have the answer to.
 
-The data is a bounded, recent slice of Hacker News. Times are UTC; scores are
+The data is a bounded, recent slice of Hacker News. Times are Pacific
+(America/Los_Angeles), which the model fixes itself — never convert them; scores are
 point-in-time snapshots.`;
 
 // Turns the model may take per question. The last one is reserved: tools are
@@ -94,23 +95,24 @@ const toResponsesTools = (tools) =>
     parameters: t.parameters,
   }));
 
-/** Pull the renderable Malloy result out of an executeQuery tool response.
- *  Publisher returns the malloy-interfaces Result verbatim (schema + data +
- *  the compiled sql), which is exactly what the chart and the SQL panel need —
- *  so there is no reason to run the query a second time over REST. */
-function parseQueryResult(text) {
-  try {
-    const parsed = JSON.parse(text);
-    return parsed?.schema && parsed?.data ? parsed : null;
-  } catch {
-    return null;
-  }
+/** The Malloy a tool call will run, or null if the call isn't a query. */
+function queryOf(name, args) {
+  if (name !== 'malloy_executeQuery') return null;
+  if (typeof args.query === 'string') return args.query;
+  return args.sourceName && args.queryName ? `run: ${args.sourceName} -> ${args.queryName}` : null;
 }
+
+/** What a non-query call asked for, for the trace: every Publisher tool takes
+ *  its subject in `query` (getContext, searchDocs) or `source` (compile). */
+const argumentOf = (args) =>
+  [args.query, args.source, args.sourceName].find((v) => typeof v === 'string' && v.trim()) || undefined;
 
 export async function streamChat({ mcp, history, userText, on, signal, client = defaultClient() }) {
   const tools = toResponsesTools(mcp.tools);
-  let lastQuery = null;
-  let lastResult = null;
+  // The trace behind the answer: one entry per tool call, in the order they ran.
+  // The UI shows this, so a failed attempt stays in it — it is part of how the
+  // answer was reached — marked so the panel doesn't offer a result for it.
+  const steps = [];
 
   // First request carries the conversation; subsequent tool round-trips chain
   // off previous_response_id and send only the tool outputs.
@@ -121,7 +123,7 @@ export async function streamChat({ mcp, history, userText, on, signal, client = 
   let previousResponseId;
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
-    if (signal?.aborted) return { answer: '', lastQuery, lastResult, aborted: true };
+    if (signal?.aborted) return { answer: '', steps, aborted: true };
     // On the final turn, take the tools away and ask for the answer, so the
     // loop can only ever end in prose.
     const finalTurn = turn === MAX_TURNS - 1;
@@ -157,27 +159,20 @@ export async function streamChat({ mcp, history, userText, on, signal, client = 
 
     const calls = (final.output || []).filter((o) => o.type === 'function_call');
     if (calls.length === 0) {
-      return { answer: text, lastQuery, lastResult };
+      return { answer: text, steps };
     }
 
     // Execute each tool call and feed the outputs back on the next turn.
     input = [];
     for (const call of calls) {
-      if (signal?.aborted) return { answer: text, lastQuery, lastResult, aborted: true };
+      if (signal?.aborted) return { answer: text, steps, aborted: true };
       let args = {};
       try {
         args = JSON.parse(call.arguments || '{}');
       } catch {
         /* leave empty; tool will error informatively */
       }
-      const queryStr =
-        call.name === 'malloy_executeQuery'
-          ? typeof args.query === 'string'
-            ? args.query
-            : args.sourceName && args.queryName
-              ? `run: ${args.sourceName} -> ${args.queryName}`
-              : null
-          : null;
+      const queryStr = queryOf(call.name, args);
       if (queryStr) on.query?.(queryStr);
       else on.tool?.(call.name);
 
@@ -185,13 +180,14 @@ export async function streamChat({ mcp, history, userText, on, signal, client = 
       console.error(
         `[tool] ${call.name} args=${JSON.stringify(args).slice(0, 200)} -> ${result.text.length} chars${result.isError ? ' (ERROR)' : ''}`
       );
-      // Only surface a query in the UI if it actually ran, so a trailing failed
-      // attempt doesn't populate the panel with a broken query. Keep its result
-      // payload too — it already carries the schema, rows, and compiled SQL.
-      if (queryStr && !result.isError) {
-        lastQuery = queryStr;
-        lastResult = parseQueryResult(result.text) ?? lastResult;
-      }
+      // The step records what ran, not what came back: the tool payload is
+      // shaped for the model to read, not for the renderer, and carries no SQL.
+      // The caller re-runs the queries over REST to fill the panel.
+      steps.push(
+        queryStr
+          ? { kind: 'query', detail: queryStr, ok: !result.isError }
+          : { kind: 'tool', detail: call.name, argument: argumentOf(args), ok: !result.isError }
+      );
 
       input.push({
         type: 'function_call_output',
@@ -201,5 +197,5 @@ export async function streamChat({ mcp, history, userText, on, signal, client = 
     }
   }
 
-  return { answer: '', lastQuery, lastResult };
+  return { answer: '', steps };
 }

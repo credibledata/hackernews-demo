@@ -34,8 +34,16 @@ export async function openConnection() {
   const instance = await DuckDBInstance.create(':memory:');
   const con = await instance.connect();
   await con.run('INSTALL httpfs; LOAD httpfs;');
+  // Pinned so the ETL means the same thing on a laptop as in the container:
+  // otherwise any timestamp comparison here would silently follow the host's
+  // local zone. This matches how Malloy's DuckDB connection runs.
+  await con.run("SET TimeZone = 'UTC';");
   return con;
 }
+
+// The zone hn.malloy reports in. The source files are partitioned by UTC month,
+// so the two disagree at the window's edges — see the trim in buildData.
+const MODEL_TZ = 'America/Los_Angeles';
 
 const monthIndex = (m) => {
   const [y, mo] = m.split('-').map(Number);
@@ -185,14 +193,36 @@ export async function refreshLiveScores(
  */
 export async function buildData(
   con,
-  { sourceFiles, outDir, types = [1, 2, 5], refreshScores = false, fetchImpl, onProgress } = {}
+  {
+    sourceFiles,
+    outDir,
+    types = [1, 2, 5],
+    refreshScores = false,
+    startMonth,
+    fetchImpl,
+    onProgress,
+  } = {}
 ) {
   if (!sourceFiles?.length) throw new Error('buildData: sourceFiles is required');
+  if (startMonth !== undefined && !/^\d{4}-\d{2}$/.test(startMonth)) {
+    throw new Error(`buildData: startMonth must be "YYYY-MM", got ${JSON.stringify(startMonth)}`);
+  }
   await mkdir(outDir, { recursive: true });
   const storiesPath = path.join(outDir, 'stories.parquet');
   const commentsPath = path.join(outDir, 'comments.parquet');
   const src = readParquetExpr(sourceFiles);
   const typeList = types.join(', ');
+
+  // The first hours of the window's first UTC day are still the previous month
+  // in the zone the model reports in, so they would land in a leading bucket
+  // holding a fraction of a day — 142 stories against June's 18,323 in the
+  // 2012-06 slice. Drop them, and the monthly views start on a whole month.
+  // The window's tail is short by the same offset for the opposite reason; that
+  // costs the final month under 1% and is left alone rather than pulling down
+  // another month of source data to square it off.
+  const trim = startMonth
+    ? `AND time >= timezone('${MODEL_TZ}', TIMESTAMP '${startMonth}-01 00:00:00')`
+    : '';
 
   // One working table: live items in the window, heavy columns dropped.
   await con.run(`
@@ -211,7 +241,8 @@ export async function buildData(
     FROM ${src}
     WHERE coalesce(deleted, 0) = 0
       AND coalesce(dead, 0) = 0
-      AND type IN (${typeList});
+      AND type IN (${typeList})
+      ${trim};
   `);
 
   // Before anything is written: replace the ingest-time score/comment snapshots
@@ -324,10 +355,20 @@ if (isMain) {
     outDir,
     types,
     refreshScores,
+    startMonth,
     onProgress: (done, total) => console.log(`[prep]   live refresh ${done}/${total}`),
   });
   // Marker the container entrypoint reads to decide whether to re-fetch on boot.
   await writeFile(path.join(outDir, '.window'), `${months}:${end || 'latest'}\n`);
+  await writeFile(
+    path.join(outDir, '.metadata.json'),
+    JSON.stringify({
+      refreshedAt: new Date().toISOString(),
+      scoresRefreshed: refreshScores,
+      startMonth,
+      endMonth,
+    }) + '\n'
+  );
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(
     `[prep] done in ${secs}s → ${outDir}\n` +

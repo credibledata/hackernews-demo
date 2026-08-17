@@ -116,7 +116,11 @@ body {
 
 /* 100dvh, not 100vh: iOS Safari's collapsing URL bar otherwise pushes the
    composer off-screen. */
-.app { display: flex; flex-direction: column; height: 100dvh; max-width: var(--max-width); margin: 0 auto; }
+.app { display: flex; flex-direction: column; height: 100dvh; }
+/* The width cap lives on the rows, not on .app — so the thread's scroll
+   container spans the window and its scrollbar sits at the browser edge
+   instead of floating at the inside edge of a centred column. */
+.topbar, .composer, .thread-inner { width: 100%; max-width: var(--max-width); margin-inline: auto; }
 
 /* Top bar */
 .topbar {
@@ -151,6 +155,13 @@ body {
   transition: border-color 0.12s, color 0.12s;
 }
 .icon-btn:hover { border-color: var(--hn-orange); color: var(--hn-orange); }
+.source-btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--panel);
+  color: var(--ink); font-size: 13px; font-weight: 600; text-decoration: none;
+  box-shadow: var(--shadow-sm);
+}
+.source-btn:hover { border-color: var(--hn-orange); color: var(--hn-orange); }
 .how-btn {
   cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink);
   background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
@@ -161,10 +172,14 @@ body {
 
 /* Thread — the single scroll region (min-height:0 lets it shrink and clip
    inside the flex column instead of overflowing the page). */
-.thread { flex: 1; min-height: 0; overflow-y: auto; padding: 28px 24px; }
+/* both-edges: where the scrollbar takes space (Windows/Linux), reserving it on
+   one side alone would shift the centred column out of line with the header. */
+.thread { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable both-edges; }
 /* Full-height flex column so the empty state can centre itself with auto
-   margins; once there are messages the content just stacks from the top. */
-.thread-inner { display: flex; flex-direction: column; min-height: 100%; }
+   margins; once there are messages the content just stacks from the top.
+   The padding rides here rather than on .thread so it stays inside the
+   width cap. */
+.thread-inner { display: flex; flex-direction: column; min-height: 100%; padding: 28px 24px; }
 
 .empty { max-width: 680px; margin: auto; padding: 16px 0 8px; text-align: center; }
 .empty h1 { font-size: 28px; margin: 0 0 12px; letter-spacing: -0.02em; }
@@ -195,12 +210,6 @@ body {
   box-shadow: var(--shadow-sm); transition: border-color 0.12s, color 0.12s, transform 0.12s;
 }
 .chip:hover { border-color: var(--hn-orange); color: var(--hn-orange); transform: translateY(-1px); }
-/* Chip-shaped placeholders while the starter questions load. */
-.chip-ghost {
-  height: 37px; border-radius: 999px; background: var(--border);
-  animation: chip-pulse 1.4s ease-in-out infinite;
-}
-@keyframes chip-pulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 0.8; } }
 
 .mcp-connect { margin-top: 32px; font-size: 13px; color: var(--muted); line-height: 1.6; }
 /* The command and its copy button share one dark plate; the button floats over
@@ -371,6 +380,15 @@ body {
   font-size: 13px; font-weight: 600; color: var(--accent); background: none;
   border: none; padding: 10px 14px; text-align: left; font-family: inherit;
 }
+/* The gloss heads the card: what the numbers mean, above the toggle that opens
+   onto how they were reached. A header row, not a standalone callout — the card
+   supplies the frame. */
+.interpretation {
+  padding: 10px 14px; border-left: 3px solid var(--hn-orange);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted); font-size: 13px; line-height: 1.5;
+}
+.interpretation b { color: var(--ink-soft); }
 .hood-caret { color: var(--muted); transition: transform 0.15s; display: inline-block; }
 .hood.open .hood-caret { transform: rotate(90deg); }
 .hood-summary { color: var(--muted); font-weight: 500; }
@@ -387,6 +405,27 @@ body {
   font-size: 12.5px; line-height: 1.7;
 }
 .hood-steps li::marker { color: var(--hn-orange); }
+.hood-steps li { padding: 1px 0; }
+/* Steps that ran a query are buttons — selecting one shows its work below.
+   The rest are plain rows, so only what can be inspected looks clickable. */
+.hood-step {
+  display: block; width: 100%; text-align: left; padding: 2px 6px;
+  border: none; background: none; border-radius: 6px; color: inherit;
+  font: inherit; line-height: inherit;
+}
+button.hood-step { cursor: pointer; }
+button.hood-step:hover { background: var(--inline-code-bg); color: var(--ink); }
+.hood-steps li.active > .hood-step { background: var(--inline-code-bg); color: var(--ink); }
+.hood-steps li.active::marker { font-weight: 700; }
+.hood-steps li.failed .step-label { text-decoration: line-through; }
+.step-flag { color: var(--hn-orange); text-decoration: none; }
+.step-rows { margin-left: 8px; opacity: 0.75; }
+/* The query or search term the step used — one line, clipped rather than
+   wrapped, so a long custom query doesn't push the trace off the screen. */
+.step-note {
+  display: block; font-size: 11.5px; opacity: 0.8;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 .hood-tabs { display: flex; align-items: center; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
 .hood-tab {
@@ -492,6 +531,35 @@ body {
   letter-spacing: 0.04em;
 }
 .modal-steps p { margin: 0; line-height: 1.6; font-size: 14px; color: var(--ink-soft); }
+.modal-steps p.modal-note { margin-top: 10px; font-size: 13.5px; color: var(--muted); }
+.modal-note code {
+  font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px;
+  background: var(--inline-code-bg); padding: 1px 5px; border-radius: 4px;
+}
+.model-toggle { margin-top: 12px; }
+
+/* Model source, opened as a right-hand column. The modal itself stops scrolling
+   when the panel is up: each column carries its own scroll, so a 270-line model
+   doesn't drag the explanation off-screen with it. */
+.modal.has-panel { max-width: 1080px; display: flex; overflow: hidden; }
+.modal.has-panel .modal-body { flex: 1 1 44%; min-width: 0; overflow-y: auto; padding-right: 26px; }
+.model-panel {
+  flex: 1 1 56%; min-width: 0; display: flex; flex-direction: column;
+  border-left: 1px solid var(--border); padding-left: 26px;
+}
+.model-panel-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px; padding-right: 30px; /* clear of the modal's × */
+}
+.model-panel-title {
+  flex: 1; font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12.5px; font-weight: 600; color: var(--muted);
+}
+/* Wrapped, unlike the query blocks: most of this file's width is prose in
+   #(doc) notes, and scrolling sideways to read a sentence is worse than a
+   soft-wrapped line. Wraps at spaces only, so identifiers stay whole. */
+.model-panel .code { flex: 1; min-height: 0; overflow: auto; white-space: pre-wrap; }
+.model-panel-status { margin: 0; font-size: 13px; color: var(--muted); }
 
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes pop { from { opacity: 0; transform: translateY(6px) scale(0.99); } to { opacity: 1; transform: none; } }
@@ -504,9 +572,22 @@ body {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
+/* Below the two-column width the panel stacks under the explanation, and the
+   modal goes back to being the single scroll container. */
+@media (max-width: 900px) {
+  .modal.has-panel { display: block; max-width: 640px; overflow-y: auto; }
+  .modal.has-panel .modal-body { padding-right: 0; overflow: visible; }
+  .model-panel {
+    border-left: none; border-top: 1px solid var(--border);
+    padding-left: 0; padding-top: 18px; margin-top: 4px;
+  }
+  .model-panel-head { padding-right: 0; }
+  .model-panel .code { max-height: 55vh; }
+}
+
 @media (max-width: 640px) {
   .topbar { padding: 12px 16px; gap: 10px; align-items: center; }
-  .thread { padding: 20px 16px; }
+  .thread-inner { padding: 20px 16px; }
   .composer { padding: 12px 16px; }
   /* The actions squeeze the brand into a narrow column here, and a clamped
      subtitle just truncates mid-word — so drop it and keep the attribution,

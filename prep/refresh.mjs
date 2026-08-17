@@ -114,6 +114,15 @@ async function runRefresh() {
   // Markers travel with the version dir, so they follow the symlink.
   await writeFile(path.join(outDir, '.window'), `${months}:${end || 'latest'}\n`);
   await writeFile(path.join(outDir, '.version'), `${n + 1}\n`);
+  await writeFile(
+    path.join(outDir, '.metadata.json'),
+    JSON.stringify({
+      refreshedAt: new Date().toISOString(),
+      scoresRefreshed: process.env.HN_REFRESH_SCORES !== '0',
+      startMonth,
+      endMonth,
+    }) + '\n'
+  );
 
   await swapLink(nextName);
   log(`swapped data -> ${nextName} (${stats.stories.toLocaleString()} stories, ${stats.comments.toLocaleString()} comments)`);

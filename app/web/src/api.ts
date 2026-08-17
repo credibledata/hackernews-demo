@@ -3,14 +3,35 @@
 
 export type ChatTurn = { role: 'user' | 'assistant'; content: string };
 
+// One tool call the agent made. `detail` is the Malloy for a query step and the
+// tool name for anything else; `argument` is what a non-query call asked for.
+// A query step that ran carries its own SQL and rows, so any step in the trace
+// can be inspected — not just the one the answer rests on.
+export type Step = {
+  kind: 'query' | 'tool';
+  detail: string;
+  argument?: string;
+  ok: boolean;
+  sql?: string | null;
+  data?: unknown | null;
+  rows?: number;
+  interpretation?: string;
+};
+
 export type UnderTheHood = {
   malloyQuery: string;
   sql: string | null;
   // Malloy result payload for <MalloyChart>; shape is a malloy-interfaces Result.
   data: unknown | null;
+  // Every step behind the answer, and the index of the one the fields above
+  // repeat — the result the chart and the CSV download are built from.
+  steps: Step[];
+  primary: number;
   // True when the backend replayed a previously computed answer for this
   // question rather than running the agent again.
   cached?: boolean;
+  // Deterministic explanation of the governed semantics used by the query.
+  interpretation?: string;
 };
 
 export type ChatHandlers = {
@@ -23,26 +44,38 @@ export type ChatHandlers = {
 
 // What the data slice covers. `from`/`to` are ISO timestamps of the first and
 // last story loaded.
-export type Dataset = { stories: number; comments: number; from: string; to: string };
+export type Dataset = {
+  stories: number;
+  comments: number;
+  from: string;
+  to: string;
+  refreshedAt?: string;
+  scoresRefreshed?: boolean;
+};
 
-export type Starter = { suggestions: string[]; dataset: Dataset | null };
-
-/** The empty state's contents; degrades to empty on any failure so the UI can fall back. */
-export async function fetchStarter(): Promise<Starter> {
-  const empty: Starter = { suggestions: [], dataset: null };
+/** Scope of the loaded slice; null on any failure, so the note is simply omitted. */
+export async function fetchDataset(): Promise<Dataset | null> {
   try {
-    const res = await fetch('/chat/starter');
-    if (!res.ok) return empty;
+    const res = await fetch('/chat/dataset');
+    if (!res.ok) return null;
     const body = await res.json();
-    return {
-      suggestions: Array.isArray(body.suggestions)
-        ? body.suggestions.filter((s: unknown) => typeof s === 'string')
-        : [],
-      dataset: body.dataset?.stories ? body.dataset : null,
-    };
+    return body.dataset?.stories ? body.dataset : null;
   } catch {
-    return empty;
+    return null;
   }
+}
+
+/**
+ * The Malloy model source, for the "How this works" panel. Throws rather than
+ * returning null: the panel is opened deliberately, so a reader who asked to
+ * see the model needs to be told it couldn't be loaded, not shown a blank.
+ */
+export async function fetchModelSource(): Promise<string> {
+  const res = await fetch('/chat/model');
+  if (!res.ok) throw new Error(`model source unavailable (${res.status})`);
+  const body = await res.json();
+  if (typeof body.text !== 'string' || !body.text) throw new Error('model source was empty');
+  return body.text;
 }
 
 export async function sendMessage(
