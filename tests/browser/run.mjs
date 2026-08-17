@@ -14,8 +14,22 @@ import { fileURLToPath } from 'node:url';
 import { launch, sleep } from './cdp.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const UI = 'http://localhost:5173';
+const WEB_PORT = Number(process.env.HN_TEST_WEB_PORT || 5173);
+const MOCK_PORT = Number(process.env.HN_TEST_MOCK_PORT || 8787);
+const UI = `http://localhost:${WEB_PORT}`;
 const children = [];
+
+// The starter questions are fixed UI copy, not backend-derived — the backend
+// serves no questions at all, so chips that appear can only come from the
+// frontend. Each one leans on a term the Malloy model defines
+// ("best", "perform", "engagement", "successful"), which is the point of the
+// demo: the answer has to say which definition it used.
+const STARTERS = [
+  'When is the best time to post?',
+  'Which domains perform best on Hacker News?',
+  'Do Ask HN or Show HN posts get more engagement?',
+  'How rare is a successful story?',
+];
 
 let tearingDown = false;
 
@@ -82,10 +96,13 @@ const THREAD = `
 
 async function main() {
   console.log('starting mock backend and dev server…');
+  process.env.MOCK_PORT = String(MOCK_PORT);
+  process.env.HN_WEB_PORT = String(WEB_PORT);
+  process.env.HN_CHAT_PROXY = `http://127.0.0.1:${MOCK_PORT}`;
   start(process.execPath, [path.join(ROOT, 'tests/browser/mock-backend.mjs')], ROOT, 'mock');
   start('npm', ['run', 'dev'], path.join(ROOT, 'app/web'), 'vite');
 
-  await waitForHttp('http://127.0.0.1:8787/chat/health', 'mock backend');
+  await waitForHttp(`http://127.0.0.1:${MOCK_PORT}/chat/health`, 'mock backend');
   await waitForHttp(UI, 'vite dev server');
 
   const page = await launch();
@@ -96,11 +113,11 @@ async function main() {
   });
   console.log('running tests…\n');
 
-  await test('empty state offers starter chips, and the MCP command lives in How this works', async () => {
+  await test('empty state offers the fixed starter chips, and the MCP command lives in How this works', async () => {
     await page.goto(UI);
     await page.waitFor(`document.querySelectorAll('.empty .chip').length > 0`);
-    const chips = await page.eval(`return document.querySelectorAll('.empty .chip').length`);
-    assert(chips >= 3, `expected starter chips, got ${chips}`);
+    const chips = await page.eval(`return [...document.querySelectorAll('.empty .chip')].map(c => c.textContent)`);
+    assertEqual(chips.join(' | '), STARTERS.join(' | '), 'starter chips');
     assert(
       !(await page.eval(`return !!document.querySelector('.empty .mcp-connect')`)),
       'MCP block should not be on the empty state'
@@ -108,11 +125,42 @@ async function main() {
     const scope = await page.eval(`return document.querySelector('.dataset-note')?.textContent || ''`);
     assert(/18,465 stories/.test(scope), `dataset scope missing from the empty state: "${scope}"`);
     assert(/Jun 2012/.test(scope), `dataset window missing from the empty state: "${scope}"`);
+    assert(/refreshed Aug 16, 2026/.test(scope), `refresh date missing from the empty state: "${scope}"`);
+    assert(/scores refreshed from HN/.test(scope), `score provenance missing from the empty state: "${scope}"`);
+    assert(
+      await page.eval(`return !!document.querySelector('a.source-btn')`),
+      'visible source link missing from the header'
+    );
     await page.eval(`
       const b = [...document.querySelectorAll('.how-btn')].find(x => x.textContent.includes('How this works'));
       b.click();
     `);
     await page.waitFor(`!!document.querySelector('.modal .mcp-copy')`);
+    await page.eval(`document.querySelector('.modal-close').click()`);
+  });
+
+  await test('How this works opens the real model source in a side panel', async () => {
+    await page.goto(UI);
+    await page.waitFor(`document.querySelectorAll('.empty .chip').length > 0`);
+    await page.eval(`
+      [...document.querySelectorAll('.how-btn')].find(x => x.textContent.includes('How this works')).click();
+    `);
+    await page.waitFor(`!!document.querySelector('.model-toggle')`);
+    await page.eval(`document.querySelector('.model-toggle').click()`);
+    await page.waitFor(`!!document.querySelector('.model-panel .code')`, { label: 'model source' });
+
+    // The panel must show the file itself, not a summary of it — the point of
+    // the panel is that the reader can check the model against the answers.
+    const source = await page.eval(`return document.querySelector('.model-panel .code').textContent`);
+    assert(/source: stories is stories_base extend/.test(source), 'model panel is missing the stories source');
+    assert(/is_successful is score >= 100/.test(source), 'model panel is missing the governed success definition');
+    assert(
+      await page.eval(`return !!document.querySelector('.modal.has-panel')`),
+      'modal should widen into its two-column layout when the panel is open'
+    );
+
+    await page.eval(`document.querySelector('.model-toggle').click()`);
+    await page.waitFor(`!document.querySelector('.model-panel')`, { label: 'panel to close' });
     await page.eval(`document.querySelector('.modal-close').click()`);
   });
 
@@ -126,6 +174,8 @@ async function main() {
   await test('answer streams and the under-the-hood panel exposes Malloy, SQL and Data', async () => {
     await page.waitFor(`!!document.querySelector('.hood')`, { timeoutMs: 30000 });
     await page.waitFor(`!document.querySelector('.stop-btn')`, { label: 'stream to finish' });
+    const interpretation = await page.eval(`return document.querySelector('.interpretation')?.textContent || ''`);
+    assert(/Interpreted as:/.test(interpretation), `interpretation missing: "${interpretation}"`);
     await page.eval(`document.querySelector('.hood-toggle').click(); return 1`);
     await sleep(300);
     const tabs = await page.eval(
@@ -138,7 +188,69 @@ async function main() {
 
     // The step trace is what makes the answer auditable.
     const steps = await page.eval(`return document.querySelectorAll('.hood-steps li').length`);
-    assertEqual(steps, 2, 'recorded agent steps');
+    assertEqual(steps, 4, 'recorded agent steps');
+  });
+
+  // The panel has to show how the answer was built, not just the query the
+  // agent happened to stop on: every step, each query's own rows, and the one
+  // the answer rests on selected to begin with.
+  await test('the trace shows every step, and each query can be inspected', async () => {
+    const stepText = await page.eval(
+      `return [...document.querySelectorAll('.hood-steps li')].map(s => s.textContent)`
+    );
+    assert(/story scores by hour/.test(stepText[0]), `discovery step should show what it asked for: "${stepText[0]}"`);
+    assert(/Ran a Malloy query/.test(stepText[1]), `failed query should still be listed: "${stepText[1]}"`);
+    assert(/3 rows/.test(stepText[2]), `a query step should show its row count: "${stepText[2]}"`);
+
+    // A query that errored has no result to offer, so it isn't selectable.
+    assertEqual(
+      await page.eval(`return document.querySelectorAll('.hood-steps li button').length`),
+      2,
+      'selectable steps (the two queries that returned rows)'
+    );
+    assert(
+      await page.eval(`return !!document.querySelector('.hood-steps li.failed')`),
+      'the failed query is not marked as such'
+    );
+
+    // The richest result is selected, not the trailing one-row lookup.
+    assertEqual(
+      await page.eval(`return document.querySelector('.hood-steps .active').textContent.includes('3 rows')`),
+      true,
+      'the primary step starts selected'
+    );
+    assert(
+      /by_category/.test(await page.eval(`return document.querySelector('.hood .code').textContent`)),
+      'the panel should open on the primary query'
+    );
+    const openedOn = await page.eval(`return document.querySelector('.interpretation').textContent`);
+    assert(
+      /governed submission categories/.test(openedOn),
+      `the gloss should describe the primary query, got "${openedOn}"`
+    );
+
+    // Selecting the other query swaps the Malloy, the SQL and the rows.
+    await page.eval(`[...document.querySelectorAll('.hood-steps li button')].at(-1).click(); return 1`);
+    await sleep(200);
+    const malloy = await page.eval(`return document.querySelector('.hood .code').textContent`);
+    assert(/avg_score/.test(malloy), `selecting a step should show its Malloy, got "${malloy}"`);
+
+    // ...and the gloss with them, so the claim always describes the query on show.
+    const gloss = await page.eval(`return document.querySelector('.interpretation').textContent`);
+    assert(
+      /average HN story score/.test(gloss),
+      `the gloss should follow the selected step, got "${gloss}"`
+    );
+    const dataTab = await page.eval(
+      `return [...document.querySelectorAll('.hood-tab')].find(t => t.textContent.startsWith('Data')).textContent`
+    );
+    assertEqual(dataTab, 'Data (1)', 'row count follows the selected step');
+
+    // The chart above the panel keeps showing the result the answer rests on.
+    assert(
+      await page.eval(`return !!document.querySelector('.chart-card')`),
+      'the chart should still be rendered from the primary result'
+    );
   });
 
   await test('copying the answer link confirms it copied', async () => {

@@ -1,12 +1,17 @@
 // Chat backend HTTP server.
 //
-//   POST /api/chat        { message, history? } -> SSE stream of the answer
-//   GET  /api/health      readiness probe
+//   POST /chat/message    { message, history? } -> SSE stream of the answer
+//   GET  /chat/health      readiness probe
+//   GET  /chat/dataset     the slice the questions run against
+//   GET  /chat/model       the Malloy model source, for the "How this works" panel
 //
 // SSE event kinds:
 //   token   { text }                     incremental answer text
 //   status  { kind, detail }             "querying"/"thinking" indicators
-//   result  { malloyQuery, sql, data }   the query behind the answer + rendering data
+//   result  { malloyQuery, sql, data, steps, primary }
+//                                        the work behind the answer: every step
+//                                        the agent took, and the one the answer
+//                                        rests on (repeated at the top level)
 //   done    { }                          end of turn
 //   error   { message }
 
@@ -15,9 +20,9 @@ import express from 'express';
 import { config } from './config.mjs';
 import { connectMcp } from './mcp.mjs';
 import { streamChat } from './agent.mjs';
-import { compileSql, runQuery } from './publisher.mjs';
-import { getSuggestions } from './suggestions.mjs';
+import { buildTrace } from './trace.mjs';
 import { getDataset } from './dataset.mjs';
+import { getModelSource } from './model.mjs';
 import { createRateLimiter } from './ratelimit.mjs';
 import { createMetrics } from './metrics.mjs';
 import { createAnswerCache } from './answercache.mjs';
@@ -50,20 +55,15 @@ const answers = createAnswerCache({
 
 /** Replay a cached turn as the same SSE sequence a live one produces, so the
  *  client needs no special case. Text goes out in chunks rather than one blob
- *  to keep the answer readable as it lands. */
-function replayCached(send, hit) {
-  for (const step of hit.steps || []) send('status', step);
+ *  to keep the answer readable as it lands. The whole trace is stored, so a
+ *  replayed answer shows the same work the live run did. */
+function replayCached(send, { answer, ...result }) {
   const CHUNK = 60;
-  for (let i = 0; i < hit.answer.length; i += CHUNK) {
-    send('token', { text: hit.answer.slice(i, i + CHUNK) });
+  for (let i = 0; i < answer.length; i += CHUNK) {
+    send('token', { text: answer.slice(i, i + CHUNK) });
   }
-  send('result', {
-    malloyQuery: hit.malloyQuery,
-    sql: hit.sql,
-    data: hit.data,
-    cached: true,
-  });
-  send('done', { answer: hit.answer });
+  send('result', { ...result, cached: true });
+  send('done', { answer });
 }
 
 // Bound the replayed history: it is resent on every turn, so an unbounded
@@ -73,7 +73,17 @@ const MAX_HISTORY_CHARS = 4000;
 
 // One long-lived MCP connection, lazily established and reused.
 let mcpPromise = null;
-const getMcp = () => (mcpPromise ??= connectMcp());
+const getMcp = () => {
+  if (!mcpPromise) {
+    mcpPromise = connectMcp().catch((error) => {
+      // Publisher may still be starting, or may restart after a data reload.
+      // Do not pin that transient failure for the lifetime of this process.
+      mcpPromise = null;
+      throw error;
+    });
+  }
+  return mcpPromise;
+};
 
 app.get('/chat/health', async (_req, res) => {
   try {
@@ -97,13 +107,21 @@ app.get('/chat/metrics', (req, res) => {
   res.json({ model: config.model, ...metrics.snapshot(), answer_cache: answers.stats() });
 });
 
-// Everything the empty state needs: the data-derived starter questions and the
-// scope of the slice they run against. Both are built at startup and cached, so
-// this is a fast read and the chips never change under a reader mid-session.
-app.get('/chat/starter', async (_req, res) => {
+// The scope of the slice the questions run against, for the note on the empty
+// state. Built at startup and cached, so this is a fast read.
+app.get('/chat/dataset', async (_req, res) => {
   try {
-    const [suggestions, dataset] = await Promise.all([getSuggestions(), getDataset()]);
-    res.json({ suggestions, dataset });
+    res.json({ dataset: await getDataset() });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// The model source behind "How this works". Fetched only when the reader opens
+// the panel, so it stays off the critical path of a page load.
+app.get('/chat/model', async (_req, res) => {
+  try {
+    res.json({ text: await getModelSource() });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
@@ -113,6 +131,10 @@ app.post('/chat/message', async (req, res) => {
   const { message, history = [] } = req.body || {};
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'message is required' });
+  }
+  const MAX_MESSAGE_CHARS = Number(process.env.HN_MAX_MESSAGE_CHARS || 4000);
+  if (message.length > MAX_MESSAGE_CHARS) {
+    return res.status(413).json({ error: `message must be ${MAX_MESSAGE_CHARS} characters or fewer` });
   }
 
   const grant = limiter.acquire(req.ip || 'unknown');
@@ -167,42 +189,41 @@ app.post('/chat/message', async (req, res) => {
       return; // finally still records the outcome and closes the stream
     }
 
-    // Each tool call is recorded so a cached replay can reproduce the same
-    // "under the hood" trace the live run showed.
-    const steps = [];
     const mcp = await getMcp();
-    const { answer, lastQuery, lastResult, aborted } = await streamChat({
+    // The status events are the live progress line; the trace the agent returns
+    // is what the panel is built from once the answer is done.
+    const { answer, steps, aborted } = await streamChat({
       mcp,
       history: trimmed,
       userText: message,
       signal: ac.signal,
       on: {
         text: (text) => send('token', { text }),
-        query: (q) => {
-          steps.push({ kind: 'querying', detail: q });
-          send('status', { kind: 'querying', detail: q });
-        },
-        tool: (name) => {
-          steps.push({ kind: 'tool', detail: name });
-          send('status', { kind: 'tool', detail: name });
-        },
+        query: (q) => send('status', { kind: 'querying', detail: q }),
+        tool: (name) => send('status', { kind: 'tool', detail: name }),
       },
     });
 
     if (!aborted && !closedEarly) {
-      // Populate the "under the hood" panel from the last query the model ran.
-      // The MCP tool response already carries the schema, rows, and compiled
-      // SQL, so reuse it — re-running the query here would double the work and
-      // stall the chart behind a second round-trip. REST is only a fallback for
-      // a Publisher version whose tool output omits the payload.
+      // Fill the panel: every step the agent took, with its queries re-run over
+      // REST for the SQL and rows the browser renders.
+      const trace = await buildTrace(steps);
+      const lead = trace.steps[trace.primary];
       let result = null;
-      if (lastResult) {
-        result = { malloyQuery: lastQuery, sql: lastResult.sql ?? null, data: lastResult };
-      } else if (lastQuery) {
-        const data = await runQuery(lastQuery);
-        result = { malloyQuery: lastQuery, sql: data?.sql ?? (await compileSql(lastQuery)), data };
+      if (lead) {
+        // The lead result is repeated at the top level: it feeds the chart, the
+        // CSV download and the interpretation line, none of which should have to
+        // know about the trace.
+        result = {
+          malloyQuery: lead.detail,
+          sql: lead.sql,
+          data: lead.data,
+          interpretation: lead.interpretation,
+          steps: trace.steps,
+          primary: trace.primary,
+        };
+        send('result', result);
       }
-      if (result) send('result', result);
 
       // A turn that produced no prose is a failure, not a terse answer. Report
       // it as one: sent as `done`, the client would render the last query's
@@ -219,7 +240,7 @@ app.post('/chat/message', async (req, res) => {
         // Cache only a complete, grounded answer: one that finished and actually
         // ran a query. A prose-only reply has nothing to show under the hood.
         if (cacheable && result) {
-          answers.set(message, { answer, steps, ...result });
+          answers.set(message, { answer, ...result });
         }
       }
     }
@@ -247,13 +268,14 @@ app.post('/chat/message', async (req, res) => {
 app.listen(config.port, () => {
   console.log(`[chat] backend listening on :${config.port}`);
   console.log(`[chat] MCP -> ${config.mcpUrl}  REST -> ${config.restUrl}  model ${config.model}`);
-  // Build the empty state's contents at boot, not on the first page load, so
-  // the chips land as one set instead of swapping in under the reader.
-  Promise.all([getSuggestions(), getDataset()])
-    .then(([qs, ds]) =>
+  // Read the slice's scope at boot, not on the first page load, so the note on
+  // the empty state is there when the first visitor arrives.
+  getDataset()
+    .then((ds) =>
       console.log(
-        `[chat] starter ready: ${qs.length} questions` +
-          (ds ? `, ${ds.stories} stories ${ds.from.slice(0, 10)}..${ds.to.slice(0, 10)}` : ', no dataset info')
+        ds
+          ? `[chat] dataset ready: ${ds.stories} stories ${ds.from.slice(0, 10)}..${ds.to.slice(0, 10)}`
+          : '[chat] no dataset info'
       )
     )
     .catch(() => {});

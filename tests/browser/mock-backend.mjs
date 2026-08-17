@@ -11,18 +11,13 @@ import { createServer } from 'node:http';
 
 const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 8787);
 
-const SUGGESTIONS = [
-  'Which domains get the highest average score?',
-  'What are the best hours to post for a high score?',
-  'How has Ask HN vs Show HN volume changed over time?',
-  'Who are the most active commenters?',
-];
-
 const DATASET = {
   stories: 18465,
   comments: 92113,
   from: '2012-06-01T00:01:25.000Z',
   to: '2012-06-30T23:59:22.000Z',
+  refreshedAt: '2026-08-16T12:00:00.000Z',
+  scoresRefreshed: true,
 };
 
 // Long enough to overflow the viewport, so scroll behaviour is observable.
@@ -55,6 +50,48 @@ const RESULT = {
   model_annotations: [],
   sql: 'SELECT base."category", COUNT(1) FROM stories AS base GROUP BY 1',
 };
+
+// A one-row lookup: the shape the agent tends to finish on (a baseline average,
+// a total) after the query that actually answers the question.
+const ONE_ROW = {
+  schema: { fields: [{ kind: 'dimension', name: 'avg_score', type: { kind: 'number_type' } }] },
+  data: {
+    kind: 'array_cell',
+    array_value: [{ kind: 'record_cell', record_value: [{ kind: 'number_cell', number_value: 12.3 }] }],
+  },
+  connection_name: 'duckdb',
+  annotations: [],
+  model_annotations: [],
+  sql: 'SELECT AVG(base."score") FROM stories AS base',
+};
+
+// The work behind one answer: a discovery call, a query that failed, the query
+// the answer rests on, and a trailing one-row baseline.
+const traceFor = (result) => ({
+  primary: 2,
+  steps: [
+    { kind: 'tool', detail: 'malloy_getContext', argument: 'story scores by hour', ok: true },
+    { kind: 'query', detail: 'run: stories -> nope', ok: false },
+    {
+      kind: 'query',
+      detail: 'run: stories -> by_category',
+      ok: true,
+      sql: result.sql,
+      data: result,
+      rows: 3,
+      interpretation: 'story counts using the governed submission categories',
+    },
+    {
+      kind: 'query',
+      detail: 'run: stories -> { aggregate: avg_score }',
+      ok: true,
+      sql: ONE_ROW.sql,
+      data: ONE_ROW,
+      rows: 1,
+      interpretation: '“performance” measured by average HN story score',
+    },
+  ],
+});
 
 // The same rows carrying the tag Publisher returns for a chart-tagged view.
 // The renderer only draws a chart when the query says so, and the card keys its
@@ -128,10 +165,25 @@ const server = createServer(async (req, res) => {
   if (url.pathname === '/chat/health') {
     return res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true,"model":"mock"}');
   }
-  if (url.pathname === '/chat/starter') {
+  if (url.pathname === '/chat/dataset') {
     return res
       .writeHead(200, { 'content-type': 'application/json' })
-      .end(JSON.stringify({ suggestions: SUGGESTIONS, dataset: DATASET }));
+      .end(JSON.stringify({ dataset: DATASET }));
+  }
+  // The real route serves package/hn.malloy. Serve the real file here too, so
+  // the panel test fails if the model stops being readable rather than passing
+  // against a stub that can't.
+  if (url.pathname === '/chat/model') {
+    try {
+      const { getModelSource } = await import('../../app/server/model.mjs');
+      return res
+        .writeHead(200, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ text: await getModelSource() }));
+    } catch (e) {
+      return res
+        .writeHead(500, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ error: String(e?.message || e) }));
+    }
   }
   if (url.pathname !== '/chat/message' || req.method !== 'POST') {
     return res.writeHead(404).end();
@@ -184,7 +236,15 @@ const server = createServer(async (req, res) => {
     : message.includes('WIDE')
       ? WIDE_RESULT
       : RESULT;
-  send('result', { malloyQuery: 'run: stories -> by_category', sql: RESULT.sql, data: result });
+  const trace = traceFor(result);
+  const lead = trace.steps[trace.primary];
+  send('result', {
+    malloyQuery: lead.detail,
+    sql: lead.sql,
+    data: lead.data,
+    interpretation: lead.interpretation,
+    ...trace,
+  });
   send('done', { answer: text });
   res.end();
 });

@@ -10,4 +10,4 @@ A Malloy semantic model over a curated slice of the public Hacker News dataset.
   thread (`root_story_id`). Views for top commenters, comment volume by hour, and
   average comment length by story category.
 
-Times are UTC; scores are point-in-time snapshots. Built by `prep/build-data.mjs`.
+Times are Pacific (America/Los_Angeles); scores are point-in-time snapshots. Built by `prep/build-data.mjs`.

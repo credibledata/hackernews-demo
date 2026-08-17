@@ -10,7 +10,11 @@
 // Every source, dimension, measure, and view carries a #(doc) note. Those notes
 // are what an AI agent reads over MCP to ground itself — keep them accurate.
 //
-// Times are UTC.
+// Times are Pacific (America/Los_Angeles), which the two queryable sources fix
+// with a `timezone:` statement. The Parquet stores instants, and Malloy's DuckDB
+// connection runs with the session timezone pinned to UTC, so without that
+// statement every hour, day-of-week and month bucket would come back in UTC.
+// The zone is DST-aware: a June story is bucketed by PDT, a January one by PST.
 //
 // Two comment counts, which agree for most stories:
 //   `comment_count`   — total comments the story has on Hacker News right now.
@@ -21,6 +25,20 @@
 // slice ingested them. Use `comment_count` for "how much discussion did this
 // get"; use `thread_comments` when the comment rows themselves are being
 // filtered or grouped (by commenter, by hour, by length).
+//
+// There is no median. Malloy has no median()/percentile() function, and the raw
+// SQL escape (`median!(...)`) is both rejected by Publisher for queries arriving
+// over the API and un-typeable as an aggregate inside this file. So `avg_score`
+// is the only measure of centre available — on a power law, where half of all
+// stories sit at 2 points and the top 1% are above 219. Do not present it as a
+// typical story. Reach for `score_tier` / `score_distribution` for the shape,
+// and `success_rate` for "how often does this do well", which no single
+// outsized story can move.
+//
+// Window edges: the source files are partitioned by UTC month while everything
+// here buckets Pacific, so prep trims the load to whole Pacific months. The last
+// day of the window is still short by the UTC offset — under 1% of the final
+// month, and the reason a trailing month can look slightly light.
 //
 // Source-ordering note: Malloy resolves sources top-down, so a source cannot
 // reference one declared below it. `stories` and `comments` join to each other,
@@ -38,6 +56,7 @@ source: stories_base is duckdb.table('data/stories.parquet') extend {
 #(doc) Hacker News comments — one row per comment, joined to the story at the root of its thread.
 source: comments is duckdb.table('data/comments.parquet') extend {
   primary_key: id
+  timezone: 'America/Los_Angeles'
 
   join_one:
     #(doc) The story at the root of this comment's thread (null if the story predates the loaded window)
@@ -47,8 +66,12 @@ source: comments is duckdb.table('data/comments.parquet') extend {
   dimension:
     #(doc) Username of the commenter
     author is `by`
-    #(doc) Hour of day the comment was posted, 0–23 UTC
+    #(doc) Hour of day the comment was posted, 0–23 Pacific
     post_hour is hour(time)
+    #(doc) Day of week the comment was posted, 1=Sunday … 7=Saturday (Pacific)
+    post_dow is day_of_week(time)
+    #(doc) Month the comment was posted, truncated to the first of the month
+    post_month is time.month
 
   measure:
     #(doc) Number of comments
@@ -68,7 +91,7 @@ source: comments is duckdb.table('data/comments.parquet') extend {
     top: 15
   }
 
-  #(doc) Comment volume by hour of day (UTC)
+  #(doc) Comment volume by hour of day (Pacific)
   # line_chart
   view: comments_by_hour is {
     group_by: post_hour
@@ -100,6 +123,8 @@ source: comments is duckdb.table('data/comments.parquet') extend {
 //   url
 #(doc) Hacker News submissions — one row per story or job post, keyed by `id`.
 source: stories is stories_base extend {
+  timezone: 'America/Los_Angeles'
+
   join_many:
     #(doc) Every comment in this story's thread that is present in this slice
     thread is comments on thread.root_story_id = id
@@ -111,13 +136,10 @@ source: stories is stories_base extend {
     comment_count is descendants
     #(doc) Lowercased title. To find stories about a topic, match against THIS, not `title` — `title ~ '%GPT%'` is case-sensitive and would miss 'gpt'. Prefer a word-boundary regex over a bare substring: `title_words ~ r'\bgpt\b'` finds GPT but not "gpt-ish" inside another word, whereas `title_words ~ '%rust%'` also matches "trust" and "crusty".
     title_words is lower(title)
-    #(doc) Hour of day the story was posted, 0–23 UTC
+    #(doc) Hour of day the story was posted, 0–23 Pacific
     post_hour is hour(time)
-    #(doc) Day of week the story was posted, 1=Sunday … 7=Saturday (UTC)
+    #(doc) Day of week the story was posted, 1=Sunday … 7=Saturday (Pacific)
     post_dow is day_of_week(time)
-    #(doc) Calendar year the story was posted
-    # number="0"
-    post_year is year(time)
     #(doc) Month the story was posted, truncated to the first of the month
     post_month is time.month
     #(doc) Score bucket, for looking at the distribution of story success
@@ -127,12 +149,12 @@ source: stories is stories_base extend {
       pick '3. 20–99' when score < 100
       pick '4. 100–499' when score < 500
       else '5. 500+'
+    #(doc) Whether the story cleared 100 points. 100 is this model's convention for a "successful" story — Hacker News has no success flag, so the line is drawn here rather than measured. It is the same cut as score_tier's 100–499 bucket, so is_successful is exactly tiers 4 and 5. Job posts are never voted on and sit at score 1, so they are always false.
+    is_successful is score >= 100
 
   measure:
     #(doc) Number of stories
     story_count is count()
-    #(doc) Sum of all story scores
-    total_score is score.sum()
     #(doc) Average story score
     # number="#,##0.0"
     avg_score is score.avg()
@@ -148,13 +170,18 @@ source: stories is stories_base extend {
     avg_thread_comments is count(thread.id) / count()
     #(doc) Number of distinct submitters
     author_count is count(`by`)
+    #(doc) Number of stories that cleared 100 points — see `is_successful` for what that threshold means
+    successful_count is count() { where: is_successful }
+    #(doc) Share of stories that cleared 100 points. Use this for "how rare is a successful story" rather than picking a threshold per question.
+    # number="0.0%"
+    success_rate is successful_count / story_count
 
   // ── Reusable views ──────────────────────────────────────────────────
-  #(doc) Top domains by average score (min 20 stories), highest first
+  #(doc) Top domains by average score (min 20 stories), highest first. `story_count` is the sample size behind the average, not a ranking measure. Read `success_rate` next to `avg_score`: scores are a power law, so one huge story can carry a domain's average, while the share clearing 100 points cannot be moved by a single post.
   view: top_domains is {
     where: domain is not null
     group_by: domain
-    aggregate: avg_score, story_count, total_score
+    aggregate: avg_score, success_rate, story_count
     having: story_count >= 20
     order_by: avg_score desc
     top: 15
@@ -176,11 +203,11 @@ source: stories is stories_base extend {
     order_by: post_dow
   }
 
-  #(doc) Story counts by submission category
+  #(doc) Story counts by submission category, with how each category performs
   # bar_chart
   view: by_category is {
     group_by: category
-    aggregate: story_count, avg_score
+    aggregate: story_count, avg_score, success_rate
     order_by: story_count desc
   }
 
@@ -192,20 +219,11 @@ source: stories is stories_base extend {
     order_by: post_month
   }
 
-  #(doc) Monthly volume of Ask HN vs Show HN (one line per category)
-  # line_chart
-  view: ask_vs_show_over_time is {
-    where: category = 'Ask HN' or category = 'Show HN'
-    group_by: post_month, category
-    aggregate: story_count
-    order_by: post_month
-  }
-
-  #(doc) Most prolific submitters by story count, with their average score
-  view: top_authors is {
+  #(doc) Highest-volume submitters, ranked by how many stories they posted — NOT by how well those stories did. `avg_score` and `success_rate` are shown so you can see that the most prolific submitters are usually not the most successful ones. For "who does best", rank by success_rate instead.
+  view: most_prolific_authors is {
     where: author is not null
     group_by: author
-    aggregate: story_count, avg_score, total_score
+    aggregate: story_count, avg_score, success_rate
     order_by: story_count desc
     top: 15
   }
@@ -246,6 +264,9 @@ source: stories is stories_base extend {
           # label="Avg comments"
           # number="#,##0.0"
           avg_comments
+          # label="100+ points"
+          # number="0.0%"
+          success_rate
           # label="Comments here"
           thread_comments
           # label="Submitters"

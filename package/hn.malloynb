@@ -6,7 +6,7 @@ sources — `stories` (submissions) and `comments` (joined to the story at the r
 of each thread) — with reusable, documented measures and chart-tagged views. Open
 [`hn.malloy`](hn.malloy) to see how they're defined.
 
-Times are UTC; scores are point-in-time snapshots.
+Times are Pacific (America/Los_Angeles); scores are point-in-time snapshots.
 >>>malloy
 import "hn.malloy"
 >>>markdown
@@ -25,22 +25,38 @@ run: stories -> top_domains
 >>>markdown
 ## When should you post?
 
-Story volume and average score by hour of day (UTC). The two tell different
+Story volume and average score by hour of day (Pacific). The two tell different
 stories — the busiest hours aren't the highest-scoring ones.
 >>>malloy
 run: stories -> score_by_hour
 >>>markdown
 ## Ask HN vs Show HN over time
 
-Monthly volume, one line per category.
+Monthly volume, one line per category. There's no saved view for this — the
+dimensions and measures compose into it directly, which is the point of the
+model: it settles definitions, not every possible slice.
 >>>malloy
-run: stories -> ask_vs_show_over_time
+# line_chart
+run: stories -> {
+  where: category = 'Ask HN' or category = 'Show HN'
+  group_by: post_month, category
+  aggregate: story_count
+  order_by: post_month
+}
 >>>markdown
 ## How rare is a hit?
 
 The distribution of story scores across buckets — most stories never take off.
+"Successful" means 100+ points, defined once in the model rather than picked
+per question; `success_rate` is the share clearing it.
 >>>malloy
 run: stories -> score_distribution
+>>>malloy
+run: stories -> {
+  group_by: category
+  aggregate: story_count, avg_score, success_rate
+  order_by: story_count desc
+}
 >>>markdown
 ## The most-discussed stories
 >>>malloy

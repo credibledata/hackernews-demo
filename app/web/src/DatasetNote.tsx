@@ -6,8 +6,13 @@ import type { Dataset } from './api';
 
 const SOURCE_URL = 'https://huggingface.co/datasets/open-index/hacker-news';
 
+// The window these dates describe has to be read in the same zone the model
+// answers in (`timezone:` in package/hn.malloy) — otherwise a slice ending just
+// after midnight Pacific gets labelled with the next month.
+const TIME_ZONE = 'America/Los_Angeles';
+
 const monthYear = (iso: string) =>
-  new Date(iso).toLocaleDateString(undefined, { month: 'short', year: 'numeric', timeZone: 'UTC' });
+  new Date(iso).toLocaleDateString(undefined, { month: 'short', year: 'numeric', timeZone: TIME_ZONE });
 
 /** "Jun 2012 – Jul 2012", or just "Jun 2012" when the window is one month. */
 function span(from: string, to: string) {
@@ -15,6 +20,11 @@ function span(from: string, to: string) {
   const end = monthYear(to);
   return start === end ? start : `${start} – ${end}`;
 }
+
+const exactDate = (iso: string) =>
+  new Date(iso).toLocaleDateString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric', timeZone: TIME_ZONE,
+  });
 
 // Two deliberate lines — the counts and window as a stat row, the provenance
 // under it — so the note never wraps mid-phrase. Each stat is its own element
@@ -31,6 +41,7 @@ export function DatasetNote({ dataset, className = 'dataset-note' }: { dataset: 
           <b>{dataset.comments.toLocaleString()}</b> comments
         </span>
         <span>{span(dataset.from, dataset.to)}</span>
+        {dataset.refreshedAt && <span>refreshed {exactDate(dataset.refreshedAt)}</span>}
       </span>
       <span className="dataset-source">
         from{' '}
@@ -38,6 +49,8 @@ export function DatasetNote({ dataset, className = 'dataset-note' }: { dataset: 
           open-index/hacker-news
         </a>{' '}
         on Hugging Face
+        {dataset.scoresRefreshed === true && '; scores refreshed from HN'}
+        {dataset.scoresRefreshed === false && '; scores are ingest-time snapshots'}
       </span>
     </div>
   );

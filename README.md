@@ -4,14 +4,17 @@ Ask questions about Hacker News in plain English and get answers backed by a
 governed [Malloy](https://malloydata.dev) semantic model, served by the
 [Malloy Publisher](https://github.com/malloydata/publisher). An agent composes
 queries against the model instead of writing raw SQL, so the numbers come back
-right by construction — and you can see the Malloy query and the generated SQL
+consistent with governed definitions instead of inventing business logic per
+prompt — and you can see the interpretation, Malloy query, and generated SQL
 behind every answer.
 
 There are two ways in, both onto the same model:
 
 1. **A bundled chat UI** — a ChatGPT-style page. Its backend drives an OpenAI model, which
    calls the model's tools over MCP, and the UI renders each answer as a chart
-   plus an "under the hood" panel (Malloy + SQL).
+   plus a "how this was computed" card: what the numbers mean, and under it every
+   step the agent took — for each query, the Malloy, the SQL it compiled to, and
+   the rows it returned.
 2. **Direct MCP** — point Claude Code, Codex, Cursor, or any MCP client straight
    at the server and ask in plain English.
 
@@ -102,6 +105,17 @@ The model is built to answer questions like:
 - Which stories generated the most discussion?
 - How rare is a 500+ point story?
 
+The four starter chips in the UI are fixed (`STARTERS` in `app/web/src/App.tsx`)
+and each one turns on a word the model has to define first: *best time* (Pacific
+hours, and correlation rather than posting advice), *perform* (average score, and
+only for domains with at least 20 stories), *engagement* (comments on the whole
+HN thread, comment rows in this slice, or score — the model carries all three),
+and *successful* (nothing in the model marks a story successful, so the answer
+has to pick a score tier and say which). Each answer states the definition it used
+— `app/server/interpretation.mjs` derives that line from the Malloy that ran, not
+from a second model call — so the point of a semantic layer shows up on the first
+click instead of being explained.
+
 ## Configuring the data window
 
 `prep/build-data.mjs` reads a configurable lookback window (env vars):
@@ -177,6 +191,7 @@ stops billing instead of running to completion.
 | `HN_RATE_PER_SEC` | `0.2` | Sustained per-IP refill (~12/min) |
 | `HN_MAX_INFLIGHT` | `8` | Concurrent messages across all clients |
 | `HN_MAX_HISTORY` | `10` | Prior turns replayed to the model |
+| `HN_MAX_MESSAGE_CHARS` | `4000` | Maximum length of one submitted question |
 
 `/api/` and `/mcp` reach Publisher directly without touching the backend, so
 they are limited in nginx instead — otherwise anyone who found them could run
@@ -204,24 +219,13 @@ chips, and a shared `?q=` link re-asks the same question for everyone who opens
 it. Without the cache each of those is a fresh model turn, so cost scales with
 visitors rather than with distinct questions. Follow-ups are never cached — the
 answer depends on the conversation before it — and the UI marks a replayed
-answer `cached` under the hood.
+answer `cached` on the "how this was computed" card.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `HN_ANSWER_TTL_MS` | `3600000` | How long a cached answer stays valid (1h) |
 | `HN_ANSWER_CACHE_SIZE` | `200` | Distinct questions kept |
 | `HN_METRICS_TOKEN` | unset | If set, `/chat/metrics` requires `?token=` |
-
-The starter chips themselves cost a model call: they're written from the current
-top-story titles rather than hard-coded. That runs at most once a week, and the
-result is kept on disk (`.cache/suggestions.json`) so a restart re-reads it
-instead of re-rolling the questions. The directory is inside the image, so a
-rebuild starts over — mount it if you want the chips to survive a redeploy.
-
-| Var | Default | Meaning |
-| --- | --- | --- |
-| `HN_SUGGESTIONS_TTL_MS` | `604800000` | How long the starter questions stay valid (7d) |
-| `HN_CACHE_DIR` | `.cache/` at the repo root | Where they're persisted |
 
 `/chat/metrics` returns counters, cache hit rate, and answer latency (p50/p95)
 as JSON — enough to tell whether the demo is actually serving during a traffic
@@ -281,9 +285,13 @@ app/server          chat backend (MCP client + OpenAI tool loop, SSE)
   ratelimit.mjs     per-IP token bucket + global in-flight cap
   metrics.mjs       counters and answer-latency percentiles
   answercache.mjs   TTL+LRU replay of answers to repeated opening questions
+  trace.mjs         the "under the hood" trace: the agent's steps, with each
+                    query re-run over REST for its SQL and rows
+  interpretation.mjs "Interpreted as:" line, derived from the Malloy that ran
 app/web             chat UI (Vite + React + @malloydata/render)
   ChartCard.tsx     chart/table switch, CSV download, lazy renderer
-  UnderTheHood.tsx  Malloy / SQL / Data panel behind each answer
+  UnderTheHood.tsx  the card behind each answer: the "Interpreted as:" line for
+                    the query on show, over its Malloy / SQL / Data
   resultView.tsx    shared table + CSV readers over a Malloy result
   highlight.ts      dependency-free Malloy + SQL tokenizer
   public/           og.png (share card), robots.txt
@@ -298,5 +306,9 @@ tests/              hermetic unit tests + live smoke test
 
 - The image is ~1.4 GB with a small window (Node, the Publisher server, the vega
   charting bundle, and DuckDB). It scales with the baked data window.
-- Times are UTC. Scores are point-in-time snapshots from when the dataset was
-  fetched, not live values. There are no user profiles in the dataset.
+- Times are Pacific (`America/Los_Angeles`), fixed by a `timezone:` statement on
+  each source in `package/hn.malloy`, so hour, day-of-week and month buckets are
+  the same whatever the host clock says. The Parquet stores UTC instants; the
+  conversion happens in the query. Scores are point-in-time snapshots from when
+  the dataset was fetched, not live values. There are no user profiles in the
+  dataset.

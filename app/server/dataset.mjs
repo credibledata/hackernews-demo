@@ -8,6 +8,21 @@
 
 import { cached } from './cache.mjs';
 import { runQuery } from './publisher.mjs';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const DATA_DIR = process.env.HN_DATA_DIR ||
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../package/data');
+
+async function metadata() {
+  try {
+    return JSON.parse(await readFile(path.join(DATA_DIR, '.metadata.json'), 'utf8'));
+  } catch (e) {
+    if (e?.code !== 'ENOENT') console.error('[dataset] metadata', e?.message || e);
+    return {};
+  }
+}
 
 const STORIES = `run: stories -> {
   aggregate:
@@ -32,9 +47,10 @@ function firstRow(result) {
 }
 
 async function compute() {
-  const [storyRow, commentRow] = await Promise.all([
+  const [storyRow, commentRow, meta] = await Promise.all([
     runQuery(STORIES).then(firstRow),
     runQuery(COMMENTS).then(firstRow),
+    metadata(),
   ]);
   if (!storyRow.stories || !storyRow.first_post || !storyRow.last_post) return null;
   return {
@@ -42,6 +58,8 @@ async function compute() {
     comments: commentRow.comments ?? 0,
     from: storyRow.first_post,
     to: storyRow.last_post,
+    refreshedAt: meta.refreshedAt,
+    scoresRefreshed: meta.scoresRefreshed,
   };
 }
 

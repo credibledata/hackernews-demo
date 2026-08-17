@@ -35,8 +35,9 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends nginx tini curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-# Pin the Publisher server for reproducibility.
-RUN npm install -g @malloy-publisher/server@0.0.231
+# Pin the Publisher server for reproducibility. Keep this in step with the
+# `serve` script in package.json, so local dev and the image run one version.
+RUN npm install -g @malloy-publisher/server@0.0.246
 
 WORKDIR /app
 # Root deps (@duckdb/node-api) so the entrypoint can re-fetch data on boot.

@@ -10,7 +10,7 @@ services:
     build:
       context: .
       args:
-        HN_MONTHS: "3"          # small default for a fast local build; bump for more history
+        HN_MONTHS: "12"         # full year baked into the image; drop to 3 for a faster build
     ports:
       - "8080:8080"             # single fronted port (UI + /chat + /api + /mcp)
     environment:

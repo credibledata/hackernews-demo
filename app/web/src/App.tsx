@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchStarter, sendMessage, type ChatTurn, type Dataset, type UnderTheHood as Hood } from './api';
+import { fetchDataset, sendMessage, type ChatTurn, type Dataset, type UnderTheHood as Hood } from './api';
 import { Markdown } from './Markdown';
 import { HowItWorks } from './HowItWorks';
-import { UnderTheHood } from './UnderTheHood';
+import { UnderTheHood, stepLabel } from './UnderTheHood';
 import { CopyButton } from './CopyButton';
 import { DatasetNote } from './DatasetNote';
 import { downloadCsv, rowsOf } from './resultView';
@@ -13,6 +13,7 @@ import { ChartCard } from './ChartCard';
 // Kept in step with HN_MAX_HISTORY / MAX_HISTORY_CHARS in app/server/index.mjs.
 const MAX_HISTORY_TURNS = 10;
 const MAX_HISTORY_CHARS = 4000;
+const MAX_MESSAGE_CHARS = 4000;
 
 // Answer actions. Icons only — the row sits under every answer, and two words
 // of chrome per answer read as noise; the accessible name is on the button.
@@ -51,33 +52,29 @@ type Message = {
   text: string;
   question?: string; // the user question this answer belongs to, for permalinks
   status?: string;
-  steps?: string[];
   result?: Hood;
   error?: string;
   streaming?: boolean;
   stopped?: boolean;
 };
 
-// Fallback chips, shown only if the server's data-derived questions fail.
-const EXAMPLES = [
-  'Which domains get the highest average score?',
-  'What are the best hours to post for a high score?',
-  'How has Ask HN vs Show HN volume changed over time?',
-  'Who are the most active commenters?',
+// The starter questions. Fixed, and each one hinges on a word the model has to
+// define before it can answer — which is the thing being demonstrated:
+//   best time   → hours are Pacific, "best" is avg score vs. volume, and the model
+//                 flags it as correlation rather than posting advice
+//   perform     → avg score, and only for domains with enough stories to mean
+//                 anything (`top_domains` carries the min-20 guard)
+//   engagement  → comments on the whole HN thread, comment rows in this slice,
+//                 or score? The model has all three, so the answer has to pick
+//                 one and say so
+//   successful  → nothing in the model says so; the answer has to pick a score
+//                 tier and say which one it picked
+const STARTERS = [
+  'When is the best time to post?',
+  'Which domains perform best on Hacker News?',
+  'Do Ask HN or Show HN posts get more engagement?',
+  'How rare is a successful story?',
 ];
-
-// Placeholder chip widths, so the empty state holds its shape while the real
-// questions load instead of reflowing when they arrive.
-const GHOST_WIDTHS = ['272px', '244px', '298px', '212px'];
-
-// Tool names are an implementation detail; the trace should read as what the
-// agent actually did.
-const STEP_LABELS: Record<string, string> = {
-  malloy_getContext: 'Discovered the model’s sources and fields',
-  malloy_searchDocs: 'Looked up Malloy syntax',
-  malloy_compile: 'Validated the query before running it',
-  malloy_executeQuery: 'Ran a Malloy query',
-};
 
 type Theme = 'light' | 'dark';
 
@@ -100,9 +97,6 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
-  // null = still loading. The chips are never rendered from a placeholder list
-  // that later gets swapped out under the reader's eyes.
-  const [suggestions, setSuggestions] = useState<string[] | null>(null);
   const [dataset, setDataset] = useState<Dataset | null>(null);
   const [howOpen, setHowOpen] = useState(false);
   const [theme, toggleTheme] = useTheme();
@@ -119,15 +113,10 @@ export default function App() {
   // auto-scrolls when this holds, so scrolling up to read isn't fought.
   const stuck = useRef(true);
 
-  // Fetched once per session and then fixed: the backend derives them at
-  // startup, so this is a warm read and the chips land as one set. EXAMPLES is
-  // only the failure fallback.
+  // What the slice covers, for the note under the chips. Cached server-side, so
+  // this is a warm read; the empty state renders without waiting on it.
   useEffect(() => {
-    fetchStarter().then(({ suggestions: s, dataset: d }) => {
-      const unique = [...new Set(s)];
-      setSuggestions(unique.length ? unique : EXAMPLES);
-      setDataset(d);
-    });
+    fetchDataset().then(setDataset);
   }, []);
 
   // Grow the composer with its content up to the CSS max-height, then let it
@@ -221,7 +210,6 @@ export default function App() {
         question: q,
         streaming: true,
         status: 'Thinking…',
-        steps: [],
       },
     ]);
     stuck.current = true;
@@ -237,14 +225,7 @@ export default function App() {
             scrollDown();
           },
           onStatus: (kind, detail) => {
-            const label =
-              kind === 'querying' ? STEP_LABELS.malloy_executeQuery : STEP_LABELS[detail] || detail;
-            patch(botId, (m) => ({
-              ...m,
-              status: `${label}…`,
-              // Collapse consecutive repeats so a retry loop doesn't spam the trace.
-              steps: m.steps?.at(-1) === label ? m.steps : [...(m.steps ?? []), label],
-            }));
+            patch(botId, (m) => ({ ...m, status: `${stepLabel(kind, detail)}…` }));
             scrollDown();
           },
           onResult: (result) => {
@@ -300,9 +281,9 @@ export default function App() {
   };
 
   // Starter questions the user hasn't already asked, offered under the newest
-  // answer. Derived from the chips we already have — no extra model call.
+  // answer.
   const asked = new Set(messages.filter((m) => m.role === 'user').map((m) => m.text));
-  const followUps = (suggestions ?? []).filter((s) => !asked.has(s)).slice(0, 2);
+  const followUps = STARTERS.filter((s) => !asked.has(s)).slice(0, 2);
   const lastMessage = messages.at(-1);
 
   const linkTo = (question: string) => {
@@ -338,17 +319,23 @@ export default function App() {
             </button>
           )}
           <a
-            className="icon-btn"
+            className="source-btn"
             href={REPO_URL}
             target="_blank"
             rel="noreferrer"
-            title="Source on GitHub"
-            aria-label="Source on GitHub"
+            aria-label="View source on GitHub"
           >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
               <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
             </svg>
+            <span>Source</span>
           </a>
+          <button className="how-btn" onClick={() => setHowOpen(true)} aria-label="How this works">
+            <span className="how-full">How this works?</span>
+            <span className="how-short" aria-hidden="true">
+              ?
+            </span>
+          </button>
           <button
             className="icon-btn"
             onClick={toggleTheme}
@@ -356,12 +343,6 @@ export default function App() {
             aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
           >
             {theme === 'dark' ? '☀' : '☾'}
-          </button>
-          <button className="how-btn" onClick={() => setHowOpen(true)} aria-label="How this works">
-            <span className="how-full">How this works?</span>
-            <span className="how-short" aria-hidden="true">
-              ?
-            </span>
           </button>
         </div>
       </header>
@@ -373,20 +354,16 @@ export default function App() {
             <h1>What do you want to know about Hacker News?</h1>
             <p>
               Ask in plain English. An agent queries a governed Malloy model through
-              its MCP server, so the numbers come back correct — and you can see the
-              Malloy query and SQL behind every answer.
+              its MCP server, so definitions and joins are reused instead of invented
+              per prompt.
             </p>
             <DatasetNote dataset={dataset} />
             <div className="examples">
-              {suggestions
-                ? suggestions.map((e) => (
-                    <button key={e} className="chip" onClick={() => ask(e)}>
-                      {e}
-                    </button>
-                  ))
-                : GHOST_WIDTHS.map((w, i) => (
-                    <span key={i} className="chip-ghost" style={{ width: w }} aria-hidden="true" />
-                  ))}
+              {STARTERS.map((e) => (
+                <button key={e} className="chip" onClick={() => ask(e)}>
+                  {e}
+                </button>
+              ))}
             </div>
           </div>
         )}
@@ -426,15 +403,13 @@ export default function App() {
 
               {m.result?.data != null && <ChartCard data={m.result.data} />}
 
-              {m.result?.malloyQuery && (
+              {m.result?.steps?.length ? (
                 <UnderTheHood
-                  malloyQuery={m.result.malloyQuery}
-                  sql={m.result.sql}
-                  data={m.result.data}
-                  steps={m.steps ?? []}
+                  steps={m.result.steps}
+                  primary={m.result.primary}
                   cached={m.result.cached}
                 />
-              )}
+              ) : null}
 
               {m.role === 'assistant' && !m.streaming && m.question && !m.error && (
                 <div className="msg-actions">
@@ -499,6 +474,7 @@ export default function App() {
           }}
           placeholder="Ask about Hacker News data…"
           rows={1}
+          maxLength={MAX_MESSAGE_CHARS}
           aria-label="Ask a question about Hacker News"
         />
         {busy ? (
