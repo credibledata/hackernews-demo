@@ -7,8 +7,11 @@
 #   /mcp     Publisher MCP endpoint (for external agents: Claude Code, Codex, …)
 #
 # Build args:
-#   HN_MONTHS  lookback window baked into the image (default 12)
-#   HN_END     last month to include (default: latest available)
+#   HN_MONTHS     lookback window baked into the image (default 12)
+#   HN_END        last month to include (default: latest available)
+#   HN_BASE_PATH  path the UI is served under (default /); set to e.g.
+#                 /hackernews/ when a load balancer serves the demo under a
+#                 prefix and strips it before the container sees the request
 
 # ── 1) Build the web UI ──────────────────────────────────────────────────────
 FROM node:22-bookworm-slim AS web
@@ -16,7 +19,8 @@ WORKDIR /web
 COPY app/web/package.json ./
 RUN npm install --no-audit --no-fund
 COPY app/web/ ./
-RUN npm run build
+ARG HN_BASE_PATH=/
+RUN HN_BASE_PATH=${HN_BASE_PATH} npm run build
 
 # ── 2) Bake the default data window from Hugging Face ────────────────────────
 FROM node:22-bookworm-slim AS data

@@ -1,6 +1,8 @@
 // SSE client for the chat backend. Streams answer tokens and the final
 // "under the hood" payload back to the caller via callbacks.
 
+import { appUrl } from './appUrl';
+
 export type ChatTurn = { role: 'user' | 'assistant'; content: string };
 
 // One tool call the agent made. `detail` is the Malloy for a query step and the
@@ -56,7 +58,7 @@ export type Dataset = {
 /** Scope of the loaded slice; null on any failure, so the note is simply omitted. */
 export async function fetchDataset(): Promise<Dataset | null> {
   try {
-    const res = await fetch('/chat/dataset');
+    const res = await fetch(appUrl('/chat/dataset'));
     if (!res.ok) return null;
     const body = await res.json();
     return body.dataset?.stories ? body.dataset : null;
@@ -71,7 +73,7 @@ export async function fetchDataset(): Promise<Dataset | null> {
  * see the model needs to be told it couldn't be loaded, not shown a blank.
  */
 export async function fetchModelSource(): Promise<string> {
-  const res = await fetch('/chat/model');
+  const res = await fetch(appUrl('/chat/model'));
   if (!res.ok) throw new Error(`model source unavailable (${res.status})`);
   const body = await res.json();
   if (typeof body.text !== 'string' || !body.text) throw new Error('model source was empty');
@@ -86,7 +88,7 @@ export async function sendMessage(
 ): Promise<void> {
   let res: Response;
   try {
-    res = await fetch('/chat/message', {
+    res = await fetch(appUrl('/chat/message'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ message, history }),

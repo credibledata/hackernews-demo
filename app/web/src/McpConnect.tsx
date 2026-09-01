@@ -3,9 +3,10 @@
 // stays reachable instead of disappearing after the first message.
 
 import { CopyButton } from './CopyButton';
+import { appUrl } from './appUrl';
 
 export const mcpCommand = () =>
-  `claude mcp add --transport http hn ${location.origin}/mcp`;
+  `claude mcp add --transport http hn ${location.origin}${appUrl('/mcp')}`;
 
 export function McpConnect({ lead }: { lead: string }) {
   const command = mcpCommand();

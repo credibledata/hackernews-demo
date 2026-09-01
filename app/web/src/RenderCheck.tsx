@@ -3,6 +3,7 @@
 // needed; it fetches a known query straight from Publisher REST.
 import { useEffect, useState } from 'react';
 import { MalloyChart } from './MalloyChart';
+import { appUrl } from './appUrl';
 
 const QUERIES = [
   'run: stories -> by_category',
@@ -19,7 +20,7 @@ export function RenderCheck() {
       try {
         for (const q of QUERIES) {
           const r = await fetch(
-            '/api/v0/environments/hn/packages/hacker-news/models/hn.malloy/query',
+            appUrl('/api/v0/environments/hn/packages/hacker-news/models/hn.malloy/query'),
             { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: q }) }
           );
           const j = await r.json();
