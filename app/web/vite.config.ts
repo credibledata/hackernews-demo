@@ -4,8 +4,15 @@ import react from '@vitejs/plugin-react';
 const devPort = Number(process.env.HN_WEB_PORT || 5173);
 const chatTarget = process.env.HN_CHAT_PROXY || 'http://127.0.0.1:8787';
 
+// Path the app is served under. "/" for the container on its own port; a
+// deployment that puts the demo under a prefix builds with e.g.
+// HN_BASE_PATH=/hackernews/ so asset URLs and the runtime fetches in
+// src/appUrl.ts carry it. Vite wants the trailing slash.
+const base = process.env.HN_BASE_PATH || '/';
+
 // In dev, proxy the chat backend so the browser talks to one origin.
 export default defineConfig({
+  base,
   plugins: [react()],
   server: {
     port: devPort,

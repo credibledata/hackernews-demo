@@ -138,6 +138,25 @@ A wider window means richer trends and denser comment→story joins, but a large
 image and longer build. Comments whose root story predates the window resolve to a
 null root; prep logs the resolution rate so any coverage loss is visible.
 
+## Serving under a path prefix
+
+The container owns its whole port: `/`, `/chat`, `/api`, `/mcp`. To host it under
+a prefix instead — sharing a load balancer with other apps — build with
+`HN_BASE_PATH` and have the proxy strip the prefix before it forwards:
+
+```bash
+docker build --build-arg HN_BASE_PATH=/hackernews/ -t hn .
+```
+
+The browser then loads `/hackernews/…` for assets and calls
+`/hackernews/chat/message`, while the container still sees `/chat/message`, so
+nginx and both backends are unchanged. The MCP command in the UI updates itself
+to match, since it is built from the same base. Leave the arg unset for the
+normal case and nothing changes.
+
+Strip the prefix at the proxy, don't forward it: without the rewrite every
+request arrives with a path the container has no route for.
+
 ### Why the score refresh exists
 
 The Hugging Face dataset records `score` and `descendants` as they were when each
