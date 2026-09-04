@@ -58,15 +58,22 @@ done
 # ── Daily data refresh: rebuild the slice and hot-swap it in, no restart. The
 #    ETL is niced so it doesn't steal CPU from serving; a failed run leaves the
 #    current data untouched. Disable with HN_REFRESH=0.
+#
+#    Refresh first, then sleep — a container that restarts more often than the
+#    interval (or is stopped between requests) would otherwise never reach its
+#    first run and serve the baked window forever. refresh.mjs exits without
+#    building when the data it finds is younger than the interval, so a restart
+#    loop costs one metadata read rather than a rebuild.
 if [ "${HN_REFRESH:-1}" = "1" ]; then
   ( while true; do
-      sleep "${HN_REFRESH_INTERVAL:-86400}"
-      echo "[entrypoint] running scheduled data refresh…"
+      echo "[entrypoint] data refresh: checking…"
       HN_MONTHS="${HN_MONTHS:-$BAKED_HN_MONTHS}" HN_END="${HN_END:-}" \
+      HN_REFRESH_INTERVAL="${HN_REFRESH_INTERVAL:-86400}" \
         nice -n 19 node prep/refresh.mjs || echo "[entrypoint] refresh failed; kept current data"
+      sleep "${HN_REFRESH_INTERVAL:-86400}"
     done ) &
   REFRESH=$!
-  echo "[entrypoint] data refresh every ${HN_REFRESH_INTERVAL:-86400}s"
+  echo "[entrypoint] data refresh every ${HN_REFRESH_INTERVAL:-86400}s (first check now)"
 fi
 
 # ── Start the chat backend.
