@@ -44,7 +44,7 @@ const LinkIcon = (
 );
 
 const CREDIBLE_URL = 'https://credibledata.com';
-const REPO_URL = 'https://github.com/credibledata/demos/tree/main/hn-demo';
+const REPO_URL = 'https://github.com/credibledata/hackernews-demo';
 
 type Message = {
   id: number;
