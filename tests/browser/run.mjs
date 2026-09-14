@@ -22,14 +22,16 @@ const children = [];
 
 // The starter questions are fixed UI copy: the empty state has no answer to
 // follow on from, so its chips can only come from the frontend. Each one leans
-// on a term the Malloy model defines ("best", "perform", "engagement",
+// on a term the Malloy model defines ("an AI story", "engagement", "top",
 // "successful"), which is the point of the demo: the answer has to say which
-// definition it used. The chips under an answer are the other case — those come
-// from the backend, derived from the query that answered.
+// definition it used. Kept in step with STARTERS in app/web/src/App.tsx by
+// hand — this test is what catches the drift. The chips under an answer are the
+// other case entirely: those come from the backend, derived from the query that
+// answered.
 const STARTERS = [
-  'When is the best time to post?',
-  'Which domains perform best on Hacker News?',
+  'Has Hacker News turned into an AI news site?',
   'Do Ask HN or Show HN posts get more engagement?',
+  'What share of HN comments come from the top 1,000 accounts?',
   'How rare is a successful story?',
 ];
 

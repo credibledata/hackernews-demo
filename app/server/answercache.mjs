@@ -1,7 +1,7 @@
 // Cache of completed answers, keyed on the question text.
 //
 // The traffic mix this demo will actually see is dominated by a handful of
-// questions: every first-time visitor clicks one of five starter chips, and a
+// questions: every first-time visitor clicks one of four starter chips, and a
 // shared ?q= link re-asks the same question for every person who opens it.
 // Without this, each of those is a fresh model turn plus tool round-trips —
 // cost that scales linearly with visitors for an identical answer.

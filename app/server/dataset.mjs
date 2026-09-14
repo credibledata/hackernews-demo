@@ -60,6 +60,11 @@ async function compute() {
     to: storyRow.last_post,
     refreshedAt: meta.refreshedAt,
     scoresRefreshed: meta.scoresRefreshed,
+    // How far back the live score refresh reached, and how wide the window is.
+    // Both are claims the UI makes on the demo's behalf, so they come from the
+    // build rather than being hardcoded in the page.
+    scoreRefreshDays: meta.scoreRefreshDays ?? null,
+    windowMonths: meta.windowMonths ?? null,
   };
 }
 

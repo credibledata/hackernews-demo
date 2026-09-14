@@ -21,6 +21,8 @@ const DATASET = {
   to: '2012-06-30T23:59:22.000Z',
   refreshedAt: '2026-08-16T12:00:00.000Z',
   scoresRefreshed: true,
+  scoreRefreshDays: 90,
+  windowMonths: 36,
 };
 
 // Long enough to overflow the viewport, so scroll behaviour is observable.

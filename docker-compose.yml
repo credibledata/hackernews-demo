@@ -5,12 +5,16 @@
 #
 # Override the data window without a rebuild by setting HN_MONTHS / HN_END and
 # HN_REFETCH=1 (the container re-fetches from Hugging Face on boot).
+#
+# The default window is three years: ~11.4M items, ~217MB of Parquet. The first
+# build downloads ~2.5GB from Hugging Face, takes ~10 minutes and peaks at
+# ~3.2GB, so give Docker at least 4GB. Drop HN_MONTHS to 3 for a quick look.
 services:
   app:
     build:
       context: .
       args:
-        HN_MONTHS: "12"         # full year baked into the image; drop to 3 for a faster build
+        HN_MONTHS: "36"         # three years; drop to 3 for a much faster build
     ports:
       - "8080:8080"             # single fronted port (UI + /chat + /api + /mcp)
     environment:
@@ -19,3 +23,5 @@ services:
       # HN_MONTHS: "6"          # uncomment + HN_REFETCH=1 to change the window on boot
       # HN_END: "2026-06"
       # HN_REFETCH: "1"
+      # HN_REFRESH_SCORES_DAYS: "90"   # how far back the live score refresh reaches
+      # HN_REFRESH_INTERVAL: "604800"  # scheduled rebuild cadence, seconds (default weekly)
