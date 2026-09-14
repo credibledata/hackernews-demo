@@ -3,7 +3,6 @@
 package/data
 publisher_data
 publisher.db*
-docs
 .git
 *.log
 .DS_Store
