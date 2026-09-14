@@ -35,6 +35,12 @@
 // and `success_rate` for "how often does this do well", which no single
 // outsized story can move.
 //
+// What this slice covers: a rolling three-year window, not the whole of Hacker
+// News. The upstream archive starts in 2006-10 and runs to ~49M items; this
+// model is built from the last 36 months of it (HN_MONTHS). A question about
+// 2015 has no rows here — that is the window, not missing data, and worth
+// saying so rather than reporting zero.
+//
 // Window edges: the source files are partitioned by UTC month while everything
 // here buckets Pacific, so prep trims the load to whole Pacific months. The last
 // day of the window is still short by the UTC offset — under 1% of the final
@@ -116,10 +122,13 @@ source: comments is duckdb.table('data/comments.parquet') extend {
 //               'gist.github.com' and 'matklad.github.io' are separate values.
 //               Null for text posts.
 //   title     — see the title-search note on the `title_words` dimension below
-//   score     — the story's HN points, re-read from the HN API when this slice
-//               was built. Jobs are never voted on and sit at 1. The upstream
-//               dataset ships an ingest-time snapshot instead, which understates
-//               by roughly 8x; prep/build-data.mjs replaces it (HN_REFRESH_SCORES).
+//   score     — the story's HN points. Jobs are never voted on and sit at 1.
+//               The upstream dataset ships an ingest-time snapshot, which
+//               understates by roughly 8x; prep/build-data.mjs re-reads the
+//               live value from the HN API for stories posted in the last 90
+//               days (HN_REFRESH_SCORES_DAYS). Older stories keep the upstream
+//               number — a story's score has settled long before then, but it
+//               is a snapshot, not a live read.
 //   url
 #(doc) Hacker News submissions — one row per story or job post, keyed by `id`.
 source: stories is stories_base extend {
@@ -132,7 +141,7 @@ source: stories is stories_base extend {
   dimension:
     #(doc) Username of the submitter
     author is `by`
-    #(doc) Total comments the story has on Hacker News now (the HN `descendants` count, re-read from the HN API at build time). Counts the whole thread, including replies posted after this slice's window closed.
+    #(doc) Total comments the story has on Hacker News (the HN `descendants` count). Counts the whole thread, including replies posted after this slice's window closed. Re-read live from the HN API for stories from the last 90 days; older stories carry whatever the upstream archive last backfilled, which for some months is the ingest-time value — near zero. Check `score_coverage` before reading this across months, or use `thread_comments`, which counts comment rows and never goes stale.
     comment_count is descendants
     #(doc) Lowercased title. To find stories about a topic, match against THIS, not `title` — `title ~ '%GPT%'` is case-sensitive and would miss 'gpt'. Prefer a word-boundary regex over a bare substring: `title_words ~ r'\bgpt\b'` finds GPT but not "gpt-ish" inside another word, whereas `title_words ~ '%rust%'` also matches "trust" and "crusty".
     title_words is lower(title)
@@ -142,25 +151,25 @@ source: stories is stories_base extend {
     post_dow is day_of_week(time)
     #(doc) Month the story was posted, truncated to the first of the month
     post_month is time.month
-    #(doc) Score bucket, for looking at the distribution of story success
+    #(doc) Score bucket, for looking at the distribution of story success. Built on `score`, so it inherits the refresh gap: in a month the live refresh never reached, almost every story falls into '1. <5' regardless of how it actually did. Check `score_coverage` before reading this across months.
     score_tier is
       pick '1. <5' when score < 5
       pick '2. 5–19' when score < 20
       pick '3. 20–99' when score < 100
       pick '4. 100–499' when score < 500
       else '5. 500+'
-    #(doc) Whether the story cleared 100 points. 100 is this model's convention for a "successful" story — Hacker News has no success flag, so the line is drawn here rather than measured. It is the same cut as score_tier's 100–499 bucket, so is_successful is exactly tiers 4 and 5. Job posts are never voted on and sit at score 1, so they are always false.
+    #(doc) Whether the story cleared 100 points. 100 is this model's convention for a "successful" story — Hacker News has no success flag, so the line is drawn here rather than measured. It is the same cut as score_tier's 100–499 bucket, so is_successful is exactly tiers 4 and 5. Job posts are never voted on and sit at score 1, so they are always false. Check `score_coverage` before reading this across months — where the refresh missed, almost nothing clears 100 and the rate reads near zero.
     is_successful is score >= 100
 
   measure:
     #(doc) Number of stories
     story_count is count()
-    #(doc) Average story score
+    #(doc) Average story score. Check `score_coverage` before reading this across months: where the live refresh did not reach, `score` is still the ingest-time snapshot and this comes out roughly 8x low.
     # number="#,##0.0"
     avg_score is score.avg()
-    #(doc) Highest score in the group
+    #(doc) Highest score in the group. Check `score_coverage` before reading this across months — a group of unrefreshed stories tops out near 1 point.
     max_score is score.max()
-    #(doc) Average comments per story, over the whole HN thread
+    #(doc) Average comments per story, over the whole HN thread. Reads the refreshed `descendants` column, so check `score_coverage` before using it across months; `avg_thread_comments` counts comment rows instead and is stable over the whole window.
     # number="#,##0.0"
     avg_comments is descendants.avg()
     #(doc) Comments from these stories' threads that are present in this slice. Use `count(thread.id)`, never `thread.count()` — the latter also counts the empty join row for every story that has no comments here.
@@ -168,15 +177,25 @@ source: stories is stories_base extend {
     #(doc) Average comments per story counted from the comment rows in this slice
     # number="#,##0.0"
     avg_thread_comments is count(thread.id) / count()
+    #(doc) How much of this group's `score` and `descendants` are live HN values rather than upstream ingest-time snapshots. Both comment measures count the same discussion by different routes — `avg_comments` from the refreshed `descendants` column, `avg_thread_comments` from comment rows, which are never refreshed and so never go stale. They agree (0.98–1.02) wherever the refresh reached and collapse toward 0 where it did not; a month of raw ingest values reads about 0.05. Below ~0.9, every score-derived number in the row is understated — typically ~8x — and the answer should say so rather than report it straight. This describes the data window, not the stories: which months are covered changes on every rebuild, so read it rather than assuming.
+    # number="#,##0.00"
+    score_coverage is avg_comments / avg_thread_comments
     #(doc) Number of distinct submitters
     author_count is count(`by`)
-    #(doc) Number of stories that cleared 100 points — see `is_successful` for what that threshold means
+    #(doc) Number of stories that cleared 100 points — see `is_successful` for what that threshold means, and `score_coverage` for whether the months in scope can support the count.
     successful_count is count() { where: is_successful }
-    #(doc) Share of stories that cleared 100 points. Use this for "how rare is a successful story" rather than picking a threshold per question.
+    #(doc) Share of stories that cleared 100 points. Use this for "how rare is a successful story" rather than picking a threshold per question. Check `score_coverage` first and scope to the months it vouches for: blending refreshed and unrefreshed months drags the rate down without any sign that it happened.
     # number="0.0%"
     success_rate is successful_count / story_count
 
   // ── Reusable views ──────────────────────────────────────────────────
+  #(doc) Score reliability by month — run this before trending anything score-based across the window, and before quoting a rate that spans it. `score_coverage` near 1.0 means the month's scores are live HN values; near 0 means they are ingest-time snapshots, and every score number for that month is understated by roughly 8x. Months in between are the refresh boundary itself. prep/build-data.mjs re-reads scores for the last HN_REFRESH_SCORES_DAYS days and the upstream archive backfills the rest on its own schedule, so the two do not always meet: the gap between them is real, moves with every rebuild, and is visible here.
+  view: score_health is {
+    group_by: post_month
+    aggregate: score_coverage, avg_score, avg_thread_comments, story_count
+    order_by: post_month
+  }
+
   #(doc) Top domains by average score (min 20 stories), highest first. `story_count` is the sample size behind the average, not a ranking measure. Read `success_rate` next to `avg_score`: scores are a power law, so one huge story can carry a domain's average, while the share clearing 100 points cannot be moved by a single post.
   view: top_domains is {
     where: domain is not null

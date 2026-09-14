@@ -18,6 +18,18 @@ const MODEL_SOURCE_URL =
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])';
 
+// How wide the slice is, said the way a person would. It comes from the build,
+// so the copy stays true if the window is rebuilt narrower or wider; the
+// fallback is what the repo ships.
+const DEFAULT_WINDOW_MONTHS = 36;
+const YEAR_WORDS = ['', 'one', 'two', 'three', 'four', 'five'];
+function windowLabel(dataset?: Dataset | null) {
+  const months = dataset?.windowMonths || DEFAULT_WINDOW_MONTHS;
+  if (months % 12 !== 0) return `${months}-month`;
+  const years = months / 12;
+  return `${YEAR_WORDS[years] || years}-year`;
+}
+
 export function HowItWorks({
   open,
   onClose,
@@ -138,6 +150,12 @@ export function HowItWorks({
               The Malloy Publisher hosts the model as a package and serves it three ways: a REST API, an
               interactive Explorer for building queries by hand, and an MCP server so AI agents can query
               the model directly. This demo runs against a curated slice of public Hacker News data.
+            </p>
+            <p className="modal-note">
+              That slice is a rolling {windowLabel(dataset)} window, not the whole of Hacker News.
+              The upstream archive starts in October 2006 and holds about 49 million items; the demo
+              is built from the most recent of them and refreshed from Hugging Face. Ask about 2015
+              and there is nothing to answer from — that is the window, not a gap in the data.
             </p>
             <DatasetNote dataset={dataset} className="modal-dataset" />
           </section>

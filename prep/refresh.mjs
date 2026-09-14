@@ -12,6 +12,9 @@
 //      it re-opens the new files. In-flight queries keep their old file handles
 //      and finish consistently against the old data.
 //
+// The window and the score-refresh cutoff come from envConfig(), so a scheduled
+// refresh and a manual `npm run prep` mean the same thing.
+//
 // Requires the symlink layout (`package/data` -> `data.vN`); the container
 // entrypoint normalizes to it at boot.
 //
@@ -22,7 +25,13 @@
 
 import { readlink, symlink, rename, rm, readdir, writeFile, stat, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { openConnection, resolveSourceFiles, buildData } from './build-data.mjs';
+import {
+  openBuildConnection,
+  resolveSourceFiles,
+  buildData,
+  envConfig,
+  metadataFor,
+} from './build-data.mjs';
 
 const PACKAGE_DIR = path.resolve(process.env.HN_PACKAGE_DIR || 'package');
 const DATA_LINK = path.join(PACKAGE_DIR, 'data');
@@ -30,7 +39,9 @@ const LOCK_DIR = path.join(PACKAGE_DIR, '.refresh.lock');
 const LOCK_STALE_MS = 60 * 60 * 1000; // a build well under an hour; older = crashed run
 // Also how old data has to be before a run rebuilds it: the period the container
 // refreshes on and "old enough to be worth rebuilding" are the same number.
-const INTERVAL_MS = Number(process.env.HN_REFRESH_INTERVAL || 86400) * 1000;
+// The default matches docker/entrypoint.sh — weekly, since a rebuild re-reads
+// the whole window to pick up one new month.
+const INTERVAL_MS = Number(process.env.HN_REFRESH_INTERVAL || 604800) * 1000;
 
 const restUrl = process.env.PUBLISHER_REST_URL || 'http://127.0.0.1:4000/api/v0';
 const envName = process.env.HN_ENV || 'hn';
@@ -129,19 +140,33 @@ async function runRefresh() {
   const nextName = `data.v${n + 1}`;
   const outDir = path.join(PACKAGE_DIR, nextName);
 
-  const months = Number(process.env.HN_MONTHS || 12);
-  const end = process.env.HN_END || undefined;
-  const types = (process.env.HN_TYPES || '1,2,5').split(',').map((t) => Number(t.trim()));
+  const { months, end, types, refreshScores, refreshScoreDays } = envConfig();
 
-  const con = await openConnection();
-  const { files, startMonth, endMonth } = await resolveSourceFiles(con, { months, end });
-  log(`building ${startMonth}..${endMonth} (${files.length} file(s)) -> ${nextName}`);
-  const stats = await buildData(con, {
-    sourceFiles: files,
-    outDir,
-    types,
-    refreshScores: process.env.HN_REFRESH_SCORES !== '0',
-  });
+  // The scratch database is cleaned up even on a failed build: this loop runs
+  // for the life of the container, so a leak here would accumulate.
+  const { con, cleanup } = await openBuildConnection();
+  let stats;
+  let startMonth;
+  let endMonth;
+  try {
+    const resolved = await resolveSourceFiles(con, { months, end });
+    ({ startMonth, endMonth } = resolved);
+    log(
+      `building ${startMonth}..${endMonth} (${resolved.files.length} monthly file(s)` +
+        `${resolved.todayFiles.length ? ` + ${resolved.todayFiles.length} today/` : ''}) -> ${nextName}`
+    );
+    stats = await buildData(con, {
+      sourceFiles: resolved.files,
+      todayFiles: resolved.todayFiles,
+      outDir,
+      types,
+      refreshScores,
+      refreshScoreDays,
+      startMonth,
+    });
+  } finally {
+    await cleanup();
+  }
 
   // Validate before we touch anything live.
   if (!(stats.stories > 0)) throw new Error('new build has zero stories — not swapping');
@@ -155,16 +180,15 @@ async function runRefresh() {
   await writeFile(path.join(outDir, '.version'), `${n + 1}\n`);
   await writeFile(
     path.join(outDir, '.metadata.json'),
-    JSON.stringify({
-      refreshedAt: new Date().toISOString(),
-      scoresRefreshed: process.env.HN_REFRESH_SCORES !== '0',
-      startMonth,
-      endMonth,
-    }) + '\n'
+    metadataFor({ startMonth, endMonth, months, stats })
   );
 
   await swapLink(nextName);
-  log(`swapped data -> ${nextName} (${stats.stories.toLocaleString()} stories, ${stats.comments.toLocaleString()} comments)`);
+  log(
+    `swapped data -> ${nextName} (${stats.stories.toLocaleString()} stories, ` +
+      `${stats.comments.toLocaleString()} comments` +
+      `${stats.fromToday ? `, ${stats.fromToday.toLocaleString()} from today/` : ''})`
+  );
 
   // The swap is committed and the new data is valid on disk. A reload failure is
   // not fatal — Publisher serves the new data on its next reload/cycle — so log

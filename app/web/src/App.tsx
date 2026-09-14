@@ -60,19 +60,24 @@ type Message = {
 
 // The starter questions. Fixed, and each one hinges on a word the model has to
 // define before it can answer — which is the thing being demonstrated:
-//   best time   → hours are Pacific, "best" is avg score vs. volume, and the model
-//                 flags it as correlation rather than posting advice
-//   perform     → avg score, and only for domains with enough stories to mean
-//                 anything (`top_domains` carries the min-20 guard)
-//   engagement  → comments on the whole HN thread, comment rows in this slice,
-//                 or score? The model has all three, so the answer has to pick
-//                 one and say so
-//   successful  → nothing in the model says so; the answer has to pick a score
-//                 tier and say which one it picked
+//   AI news site → "an AI story" is not a column. The model matches titles, so
+//                  the answer has to show its keyword list and own what that
+//                  list misses. Spans the full window, which is the one thing
+//                  a 12-month slice could not answer.
+//   engagement   → comments on the whole HN thread, comment rows in this slice,
+//                  or score? The model has all three, and they no longer agree:
+//                  `descendants` is an ingest-time snapshot for about a third of
+//                  the window (see `score_coverage`), so picking the wrong one is
+//                  now a 20x error rather than a rounding difference.
+//   top 1,000    → by comment count, by threads joined, or by words written? And
+//                  "share of HN" means share of this window, not of all time.
+//   successful   → nothing in the model says so; the answer has to pick a score
+//                  tier and say which one it picked — then scope to the months
+//                  `score_coverage` vouches for, or the rate reads low.
 const STARTERS = [
-  'When is the best time to post?',
-  'Which domains perform best on Hacker News?',
+  'Has Hacker News turned into an AI news site?',
   'Do Ask HN or Show HN posts get more engagement?',
+  'What share of HN comments come from the top 1,000 accounts?',
   'How rare is a successful story?',
 ];
 

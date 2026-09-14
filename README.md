@@ -57,9 +57,10 @@ git-ignored — get the key from
 [platform.openai.com/api-keys](https://platform.openai.com/api-keys) and keep it
 out of commits.
 
-Open **http://localhost:8080**. The compose file bakes a small 3-month window for a
-fast first build; see [Configuring the data window](#configuring-the-data-window)
-to change it.
+Open **http://localhost:8080**. The compose file bakes a three-year window:
+962,954 stories and 10,387,170 comments, ~2.5 GB downloaded, ~10 minutes,
+peaking at 3.2 GB — give Docker at least 4 GB. Drop `HN_MONTHS` to 3 for a
+quick look — see [Configuring the data window](#configuring-the-data-window).
 
 That one container is the whole demo — Publisher, the chat backend, nginx and the
 built UI. Nothing else needs to run on the host. In the foreground, Ctrl-C stops
@@ -99,22 +100,24 @@ for per-client config and a stdio bridge.
 The model is built to answer questions like:
 
 - Which domains get the highest average score?
-- What are the best hours and days to post for a high score?
+- Has AI taken over the front page, and is it discussed as much as it is posted?
 - How has Ask HN vs Show HN volume changed over time?
 - Who are the most prolific submitters, and the most active commenters?
 - Which stories generated the most discussion?
 - How rare is a 500+ point story?
+- Which months have scores you can actually trust? (`score_health`)
 
 The four starter chips in the UI are fixed (`STARTERS` in `app/web/src/App.tsx`)
-and each one turns on a word the model has to define first: *best time* (Pacific
-hours, and correlation rather than posting advice), *perform* (average score, and
-only for domains with at least 20 stories), *engagement* (comments on the whole
-HN thread, comment rows in this slice, or score — the model carries all three),
-and *successful* (nothing in the model marks a story successful, so the answer
-has to pick a score tier and say which). Each answer states the definition it used
-— `app/server/interpretation.mjs` derives that line from the Malloy that ran, not
-from a second model call — so the point of a semantic layer shows up on the first
-click instead of being explained.
+and each one turns on a word the model has to define first: *an AI story* (not a
+column — the model matches titles, so the answer has to show its keyword list),
+*engagement* (comments on the whole HN thread, comment rows in this slice, or
+score — the model carries all three, and they no longer agree), *top 1,000*
+(by comment count, by threads joined, or by words written — and "share of HN"
+means share of this window), and *successful* (nothing in the model marks a story
+successful, so the answer has to pick a score tier and say which). Each answer
+states the definition it used — `app/server/interpretation.mjs` derives that line
+from the Malloy that ran, not from a second model call — so the point of a
+semantic layer shows up on the first click instead of being explained.
 
 The "Try next" chips under an answer are not fixed: `app/server/followups.mjs`
 maps the query that answered — a named view, or the fields a custom query reached
@@ -131,23 +134,36 @@ starters.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `HN_MONTHS` | `12` | Months back from `HN_END` |
+| `HN_MONTHS` | `36` | Months back from `HN_END` |
 | `HN_END` | latest available | Last month to include, `YYYY-MM` |
 | `HN_TYPES` | `1,2,5` | Item types: 1=story, 2=comment, 5=job |
 | `HN_REFRESH_SCORES` | `1` | Re-read scores and comment counts from the HN API; `0` skips it |
+| `HN_REFRESH_SCORES_DAYS` | `90` | How far back that refresh reaches |
 | `HN_REFRESH_CONCURRENCY` | `50` | In-flight HN API requests during that refresh |
+| `HN_SCRATCH` | `$TMPDIR/hn-etl` | Working directory for the build's DuckDB database |
+| `HN_DUCKDB_MEMORY` | DuckDB's own | `memory_limit` for the build, e.g. `4GB` |
 
 The window is built from the dataset's monthly Parquet files plus the 5-minute
 live blocks it publishes for today. Upstream only folds those blocks into the
 month's file at midnight UTC, so reading the monthly files alone leaves the slice
 up to a day behind. Live blocks are only taken when they fall inside the window,
-which means `HN_END` still pins it to whole past months.
+which means `HN_END` still pins it to whole past months. An item present in both
+keeps its monthly row — the committed one — so a rebuild is reproducible.
 
 - **At build time:** `docker build --build-arg HN_MONTHS=6 ...` bakes that window
   into the image.
 - **At boot (hybrid):** set `HN_MONTHS`/`HN_END` and `HN_REFETCH=1` on the
   container; if they differ from the baked window, it re-fetches from Hugging Face
   before serving.
+
+The default is three years, not the whole archive. Upstream goes back to
+2006-10 and holds ~49M items — 12.4 GB of source Parquet, four times this
+window. A wider window means richer trends and denser comment→story joins, but
+a larger image, a longer build and a higher peak (measured: ~10 min and 3.2 GB
+for three years). `HN_DUCKDB_MEMORY` caps DuckDB, but it is a hard cap: set
+below what the build needs, it fails rather than spilling further. Comments
+whose root story predates the window resolve to a null root; prep logs the
+resolution rate so any coverage loss is visible (96.8% on the default window).
 
 ### Keeping it current
 
@@ -159,23 +175,24 @@ failed run leaves the current data serving.
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `HN_REFRESH` | `1` | Run the scheduled refresh; `0` disables it |
-| `HN_REFRESH_INTERVAL` | `86400` | Seconds between refreshes, and how old data must be before a run rebuilds it |
+| `HN_REFRESH_INTERVAL` | `604800` | Seconds between refreshes, and how old data must be before a run rebuilds it |
+
+Weekly rather than daily: a rebuild re-reads the whole window (~2.5 GB for the
+default three years) to pick up one new month, and the `today/` files folded
+into every build already carry everything since the last monthly commit.
 
 The loop checks at boot and then every interval, so a container that restarts
-more often than the interval still refreshes; a run that finds data younger than
-the interval exits without building. `node prep/refresh.mjs --force` rebuilds
-regardless. This needs a container that keeps running between requests — on a
-host that stops it when idle, drive the refresh from an external scheduler
-instead.
+more often than the interval still refreshes — which matters more at a week than
+at a day. A run that finds data younger than the interval exits without
+building, so a restart loop costs one metadata read rather than a rebuild.
+`node prep/refresh.mjs --force` rebuilds regardless. This needs a container that
+keeps running between requests — on a host that stops it when idle, drive the
+refresh from an external scheduler instead.
 
 Freshness is bounded by the upstream dataset, not by this loop: if
 `open-index/hacker-news` stops publishing, the slice stops advancing and the
 window shown in the UI is the honest report of that. Check the dataset's commit
 history before treating a stale window as a bug here.
-
-A wider window means richer trends and denser comment→story joins, but a larger
-image and longer build. Comments whose root story predates the window resolve to a
-null root; prep logs the resolution rate so any coverage loss is visible.
 
 ## Serving under a path prefix
 
@@ -213,10 +230,47 @@ The refresh fails the build if more than 5% of items error, rather than shipping
 numbers that look authoritative and are eight times too low. Set
 `HN_REFRESH_SCORES=0` to skip it — the slice still builds, with ingest-time scores.
 
+It reaches back `HN_REFRESH_SCORES_DAYS` (90), not over the whole window. A
+story's score settles within weeks, and re-reading all 962,954 stories in a
+three-year window would mean as many Firebase requests per build — slow enough
+to get rate-limited, and a 5% failure rate fails the build. The cutoff brings
+that to 68,738 requests, a fourteenth of the work.
+
+Stories older than the cutoff keep whatever the upstream archive last backfilled,
+and that is the part worth understanding: **the backfill and the refresh window do
+not meet.** Hugging Face backfills real scores on its own schedule, months behind
+the present, so between the newest backfilled month and the start of the 90-day
+refresh there is a gap where `score` and `descendants` are still ingest-time
+snapshots. In the 2023-09 → 2026-08 slice this was written against, 11 of 36
+months fell in or beside that gap: average score 2.3 against 18.8 either side,
+60% of stories sitting at exactly 1 point, and 0.05% clearing 100 points against
+a real rate near 4.5%. Nothing errors. The numbers are simply ~8x low for about
+a quarter of the corpus, and a question spanning the window silently averages
+the two regimes together.
+
+### `score_coverage`, and how the model handles it
+
+The model does not paper over this, and it does not hardcode the boundary either
+— the boundary moves on every rebuild. Instead `stories` carries a `score_coverage`
+measure: the ratio of `avg_comments` (from the refreshed `descendants` column) to
+`avg_thread_comments` (counted from comment rows, which are never refreshed and so
+never go stale). Both count the same discussion, so the ratio sits at 0.98–1.02
+wherever the refresh reached and collapses to about 0.05 where it did not.
+
+```
+run: stories -> score_health
+```
+
+gives coverage per month, and every score-derived field's `#(doc)` points at it.
+Below about 0.9, treat the row's score numbers as understated and say so. The
+guard is derived from the data rather than a date, so it stays correct as the
+window rolls forward — and `tests/model.test.mjs` fails if a new measure over
+`score` or `descendants` ships without the warning attached.
+
 ## Run locally without Docker
 
 ```bash
-# 1. Build a data slice (1 month is quick; the default is 12).
+# 1. Build a data slice (1 month is quick; the default is 36).
 npm install
 HN_MONTHS=1 npm run prep
 

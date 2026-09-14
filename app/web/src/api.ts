@@ -56,6 +56,10 @@ export type Dataset = {
   to: string;
   refreshedAt?: string;
   scoresRefreshed?: boolean;
+  /** How far back the live score refresh reached, in days; null if unbounded. */
+  scoreRefreshDays?: number | null;
+  /** Width of the slice in months — the archive itself goes back to 2006. */
+  windowMonths?: number | null;
 };
 
 /** Scope of the loaded slice; null on any failure, so the note is simply omitted. */

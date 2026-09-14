@@ -7,7 +7,9 @@
 #   /mcp     Publisher MCP endpoint (for external agents: Claude Code, Codex, …)
 #
 # Build args:
-#   HN_MONTHS     lookback window baked into the image (default 12)
+#   HN_MONTHS     lookback window baked into the image (default 36 — three
+#                 years, ~11.4M items, ~217MB of Parquet, ~10 min to build;
+#                 see DEFAULT_MONTHS in prep/build-data.mjs)
 #   HN_END        last month to include (default: latest available)
 #   HN_BASE_PATH  path the UI is served under (default /); set to e.g.
 #                 /hackernews/ when a load balancer serves the demo under a
@@ -28,10 +30,15 @@ WORKDIR /build
 COPY package.json ./
 RUN npm install --no-audit --no-fund
 COPY prep/ ./prep/
-ARG HN_MONTHS=12
+ARG HN_MONTHS=36
 ARG HN_END=
-ENV HN_OUT=/build/data
-RUN HN_MONTHS=${HN_MONTHS} HN_END=${HN_END} node prep/build-data.mjs
+# The ETL builds through a disk-backed DuckDB (HN_SCRATCH) so DuckDB can evict
+# table blocks under pressure; measured peak for the default window is ~3.2GB.
+# Give the builder at least 4GB.
+ENV HN_OUT=/build/data \
+    HN_SCRATCH=/build/scratch
+RUN HN_MONTHS=${HN_MONTHS} HN_END=${HN_END} node prep/build-data.mjs \
+ && rm -rf /build/scratch
 
 # ── 3) Runtime ───────────────────────────────────────────────────────────────
 FROM node:22-bookworm-slim AS runtime
@@ -62,8 +69,9 @@ COPY docker/nginx.conf.template /app/nginx.conf.template
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-ARG HN_MONTHS=12
+ARG HN_MONTHS=36
 ENV BAKED_HN_MONTHS=${HN_MONTHS} \
+    HN_SCRATCH=/tmp/hn-etl \
     NODE_ENV=production \
     PORT=8080
 EXPOSE 8080

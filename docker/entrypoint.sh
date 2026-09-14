@@ -55,25 +55,30 @@ for _ in $(seq 1 90); do
   sleep 2
 done
 
-# ── Daily data refresh: rebuild the slice and hot-swap it in, no restart. The
+# ── Weekly data refresh: rebuild the slice and hot-swap it in, no restart. The
 #    ETL is niced so it doesn't steal CPU from serving; a failed run leaves the
 #    current data untouched. Disable with HN_REFRESH=0.
 #
+#    Weekly, not daily: a rebuild re-downloads the whole window (~2.5GB for the
+#    default three years) to pick up one new month, and the today/ files folded
+#    into every build already carry everything since the last monthly commit.
+#
 #    Refresh first, then sleep — a container that restarts more often than the
 #    interval (or is stopped between requests) would otherwise never reach its
-#    first run and serve the baked window forever. refresh.mjs exits without
+#    first run and serve the baked window forever, which a week-long interval
+#    makes far more likely than a day-long one. refresh.mjs exits without
 #    building when the data it finds is younger than the interval, so a restart
 #    loop costs one metadata read rather than a rebuild.
 if [ "${HN_REFRESH:-1}" = "1" ]; then
   ( while true; do
       echo "[entrypoint] data refresh: checking…"
       HN_MONTHS="${HN_MONTHS:-$BAKED_HN_MONTHS}" HN_END="${HN_END:-}" \
-      HN_REFRESH_INTERVAL="${HN_REFRESH_INTERVAL:-86400}" \
+      HN_REFRESH_INTERVAL="${HN_REFRESH_INTERVAL:-604800}" \
         nice -n 19 node prep/refresh.mjs || echo "[entrypoint] refresh failed; kept current data"
-      sleep "${HN_REFRESH_INTERVAL:-86400}"
+      sleep "${HN_REFRESH_INTERVAL:-604800}"
     done ) &
   REFRESH=$!
-  echo "[entrypoint] data refresh every ${HN_REFRESH_INTERVAL:-86400}s (first check now)"
+  echo "[entrypoint] data refresh every ${HN_REFRESH_INTERVAL:-604800}s (first check now)"
 fi
 
 # ── Start the chat backend.

@@ -1,6 +1,10 @@
 // One line stating what the answers are computed from — including where the
 // data came from. The demo's argument is that the numbers are right, which is
 // worth little if the reader can't tell what data produced them.
+//
+// That includes the limits: the slice is a window onto a much longer archive,
+// and the live score refresh only reaches back so far. Both are qualified here
+// rather than claimed flatly.
 
 import type { Dataset } from './api';
 
@@ -49,7 +53,10 @@ export function DatasetNote({ dataset, className = 'dataset-note' }: { dataset: 
           open-index/hacker-news
         </a>{' '}
         on Hugging Face
-        {dataset.scoresRefreshed === true && '; scores refreshed from HN'}
+        {dataset.scoresRefreshed === true &&
+          (dataset.scoreRefreshDays
+            ? `; scores refreshed from HN (last ${dataset.scoreRefreshDays} days)`
+            : '; scores refreshed from HN')}
         {dataset.scoresRefreshed === false && '; scores are ingest-time snapshots'}
       </span>
     </div>

@@ -123,3 +123,94 @@ test('no #(doc) note describes its times as UTC', () => {
   const stale = model.split('\n').filter((l) => l.includes('#(doc)') && /\bUTC\b/.test(l));
   assert.deepEqual(stale, [], 'these #(doc) notes still claim UTC');
 });
+
+// ── The reliable-score guard ────────────────────────────────────────────
+//
+// `score` and `descendants` are ingest-time snapshots that prep/build-data.mjs
+// re-reads from the HN API, together, in one UPDATE — but only for stories
+// younger than HN_REFRESH_SCORES_DAYS. The upstream archive backfills the rest
+// on its own schedule, and that schedule lags the refresh window by months. In
+// the slice this was written against, ten of thirty-six months carried raw
+// ingest values: average score 2.3 against 18.8 either side of the gap, and
+// 60% of stories sitting at exactly 1 point. Nothing errors. The numbers simply
+// come out ~8x low for a quarter of the corpus.
+//
+// The guard is `score_coverage` — the ratio of the two comment measures. Both
+// count the same thing, so they agree (0.98–1.02) wherever the refresh reached
+// and collapse (0.04–0.06) wherever it didn't. It needs no hardcoded dates,
+// which matters because the window rolls forward on every rebuild.
+
+/** A field's `#(doc)` and render tags — the lines the agent reads over MCP. */
+function fieldDoc(body, name) {
+  const lines = body.split('\n');
+  const i = lines.findIndex((l) => new RegExp(`^    ${name} is\\b`).test(l));
+  assert.notEqual(i, -1, `stories must define ${name}`);
+  const doc = [];
+  for (let j = i - 1; j >= 0 && lines[j].trim().startsWith('#'); j--) doc.unshift(lines[j].trim());
+  return doc.join('\n');
+}
+
+/** A field's definition, including any lines it wraps onto. */
+function fieldDef(body, name) {
+  const lines = body.split('\n');
+  const i = lines.findIndex((l) => new RegExp(`^    ${name} is\\b`).test(l));
+  assert.notEqual(i, -1, `stories must define ${name}`);
+  const out = [lines[i]];
+  for (let j = i + 1; j < lines.length && !/^(    [#\w]|  \w|\})/.test(lines[j]); j++) out.push(lines[j]);
+  return out.join('\n');
+}
+
+// Every field below is computed from `score` or `descendants`, directly or
+// through another field that is. An agent reaching over MCP sees one field's
+// #(doc) and not the file around it, so the warning has to travel on each of
+// them — a caveat in a comment block three screens up is a caveat nobody reads.
+const SCORE_DERIVED = [
+  'comment_count', 'score_tier', 'is_successful',
+  'avg_score', 'max_score', 'avg_comments',
+  'successful_count', 'success_rate',
+];
+
+test('every score-derived field points at score_coverage', () => {
+  const body = sourceBody('stories');
+  const silent = SCORE_DERIVED.filter((f) => !/score_coverage/.test(fieldDoc(body, f)));
+  assert.deepEqual(silent, [], 'these fields can read 8x low without saying so');
+});
+
+// The list above is only as good as its coverage. A new measure over `score`
+// that nobody adds to it would ship the exact bug this guard exists to catch,
+// so the test finds them itself rather than trusting the list to be current.
+test('no field touches score or descendants without being declared score-derived', () => {
+  const body = sourceBody('stories');
+  const declared = new Set([...SCORE_DERIVED, 'score_coverage']);
+  const undeclared = [...body.matchAll(/^    (\w+) is\b/gm)]
+    .map(([, name]) => name)
+    .filter((name) => !declared.has(name))
+    .filter((name) => /\b(score|descendants)\b/.test(fieldDef(body, name)));
+  assert.deepEqual(undeclared, [], 'these read refreshed columns but carry no warning');
+});
+
+// The whole guard rests on the two measures counting the same thing by
+// different routes: `avg_comments` from the refreshed `descendants` column,
+// `avg_thread_comments` from comment rows that are never refreshed and so never
+// go stale. Redefine either and the ratio stops meaning "did the refresh reach
+// these rows" while still returning a plausible number.
+test('score_coverage is the ratio of the two comment measures', () => {
+  const body = sourceBody('stories');
+  assert.match(
+    fieldDef(body, 'score_coverage'),
+    /score_coverage is avg_comments \/ avg_thread_comments/,
+    'score_coverage must compare the refreshed count against the comment rows'
+  );
+  assert.match(fieldDef(body, 'avg_comments'), /descendants/);
+  assert.match(fieldDef(body, 'avg_thread_comments'), /count\(thread\.id\)/);
+});
+
+// A ratio nobody can see is a ratio nobody checks. The view is the answer to
+// "is this window safe to trend over", and it has to be reachable by name.
+test('score_health exposes coverage per month', () => {
+  const body = sourceBody('stories');
+  const block = body.slice(body.indexOf('view: score_health is')).split('\n  #(doc)')[0];
+  assert.ok(block.startsWith('view: score_health is'), 'stories must define a score_health view');
+  assert.match(block, /group_by: post_month/, 'score_health must break coverage down by month');
+  assert.match(block, /score_coverage/, 'score_health must report score_coverage');
+});

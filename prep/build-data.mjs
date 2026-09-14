@@ -7,23 +7,29 @@
 // and each comment's root story id), and writes two local Parquet files.
 //
 // Config (env, read by the CLI at the bottom):
-//   HN_MONTHS  how many months back from HN_END          (default 12)
+//   HN_MONTHS  how many months back from HN_END          (default 36)
 //   HN_END     last month to include, "YYYY-MM"          (default: latest available)
 //   HN_TYPES   item types to keep, comma-separated        (default 1,2,5)
 //   HN_OUT     output directory                           (default ./package/data)
 //   HN_REFRESH_SCORES        set to 0 to skip the live score refresh (default on)
+//   HN_REFRESH_SCORES_DAYS   how far back the refresh reaches (default 90)
 //   HN_REFRESH_CONCURRENCY   in-flight HN API requests     (default 50)
+//   HN_SCRATCH               working dir for the DuckDB build database
+//   HN_DUCKDB_MEMORY         DuckDB memory_limit, e.g. "4GB" (default: DuckDB's own)
 //
 // The score refresh matters: the upstream dataset freezes `score` and
 // `descendants` at ingest, so without it every score-based aggregate measures
 // the first minutes after posting rather than the story's actual reception.
+// It reaches back HN_REFRESH_SCORES_DAYS, not over the whole window — see
+// DEFAULT_SCORE_REFRESH_DAYS.
 //
 // The ETL (`buildData`) takes an explicit list of source files, so it runs the
 // same whether the source is Hugging Face or a local fixture — which is what the
 // tests use.
 
 import { DuckDBInstance, quotedString } from '@duckdb/node-api';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const HF_REPO = 'hf://datasets/open-index/hacker-news';
@@ -36,11 +42,38 @@ const HF_LIVE_GLOB = `${HF_REPO}/today/*/*/*/*/*.parquet`;
 const MONTH_RE = /(\d{4})-(\d{2})\.parquet$/;
 const LIVE_MONTH_RE = /\/today\/(\d{4})\/(\d{2})\//;
 
-/** Open a DuckDB connection with httpfs loaded (needed for hf:// reads). */
-export async function openConnection() {
-  const instance = await DuckDBInstance.create(':memory:');
+// How far back the live score refresh reaches. A story settles within weeks;
+// past that a re-read costs a request and changes nothing. Over a three-year
+// window, refreshing everything would be ~1.07M requests per run — enough to
+// get rate-limited, and a 5% failure rate fails the build.
+export const DEFAULT_SCORE_REFRESH_DAYS = 90;
+
+// Three years: ~11.4M items, ~217MB of Parquet out, about 10 minutes and a
+// 3.2GB peak to build. The full archive goes back to 2006-10 and is ~49M items
+// — 4x this, which neither the image nor the refresh would take kindly to.
+export const DEFAULT_MONTHS = 36;
+
+/**
+ * Open a DuckDB connection with httpfs loaded (needed for hf:// reads).
+ *
+ * Defaults to an in-memory database, which is what the tests want. Pass
+ * `dbPath` for a real build: an in-memory database cannot evict table data, so
+ * the whole working set — `items` is ~11M rows over a three-year window — has
+ * to stay resident. Backed by a file, DuckDB writes blocks out under pressure;
+ * the measured three-year build peaks at 3.2GB rather than growing with the
+ * table.
+ *
+ * `memoryLimit` is a hard cap, not a hint. Set it below what the build needs
+ * and DuckDB fails with "failed to allocate data" instead of spilling further,
+ * so it is opt-in (HN_DUCKDB_MEMORY) and unset by default — DuckDB sizes
+ * itself to the host.
+ */
+export async function openConnection({ dbPath, memoryLimit, tempDir } = {}) {
+  const instance = await DuckDBInstance.create(dbPath || ':memory:');
   const con = await instance.connect();
   await con.run('INSTALL httpfs; LOAD httpfs;');
+  if (tempDir) await con.run(`SET temp_directory = ${quotedString(tempDir)};`);
+  if (memoryLimit) await con.run(`SET memory_limit = ${quotedString(memoryLimit)};`);
   // Pinned so the ETL means the same thing on a laptop as in the container:
   // otherwise any timestamp comparison here would silently follow the host's
   // local zone. This matches how Malloy's DuckDB connection runs.
@@ -86,7 +119,7 @@ const byMonth = (files) =>
  * new month's Parquet, where taking the blocks would grow a trailing bucket
  * holding a few hours against full months either side of it.
  */
-export function selectSourceFiles(monthlyFiles, liveFiles, { months = 12, end } = {}) {
+export function selectSourceFiles(monthlyFiles, liveFiles, { months = DEFAULT_MONTHS, end } = {}) {
   const available = byMonth(monthlyFiles);
   if (available.length === 0) {
     throw new Error(`No dataset files found at ${HF_MONTHLY_GLOB}`);
@@ -102,8 +135,13 @@ export function selectSourceFiles(monthlyFiles, liveFiles, { months = 12, end } 
   }
   const live = byMonth(liveFiles).filter((x) => x.month === endMonth);
 
+  // `files` is the flat list; `monthly` and `todayFiles` are the same files
+  // split by source, which the build needs kept apart to rank duplicates and to
+  // convert today/'s naive timestamps.
   return {
     files: [...picked.map((x) => x.file), ...live.map((x) => x.file)],
+    monthly: picked.map((x) => x.file),
+    todayFiles: live.map((x) => x.file),
     liveFiles: live.length,
     endMonth,
     startMonth: picked[0].month,
@@ -120,7 +158,7 @@ const globFiles = async (con, pattern) =>
  * dataset (a metadata call, not a data download), so a month that doesn't exist
  * yet is simply absent rather than a hard error.
  */
-export async function resolveSourceFiles(con, { months = 12, end } = {}) {
+export async function resolveSourceFiles(con, { months = DEFAULT_MONTHS, end } = {}) {
   const [monthlyFiles, liveFiles] = await Promise.all([
     globFiles(con, HF_MONTHLY_GLOB),
     // today/ is empty for a moment after each midnight roll, and absent
@@ -154,6 +192,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * Only stories and jobs (type 1 and 5) are fetched; comments carry neither
  * field. Items the API no longer knows about (deleted since ingest) keep their
  * original values — a stale number beats an invented one.
+ *
+ * `sinceDays` limits the refresh to items that young. A story's score settles
+ * within weeks, so older rows keep the upstream snapshot — which is what it
+ * already was, at a fraction of the requests. Omit it to refresh everything.
  */
 export async function refreshLiveScores(
   con,
@@ -163,13 +205,23 @@ export async function refreshLiveScores(
     retries = 3,
     retryDelayMs = 250,
     maxFailureRate = 0.05,
+    sinceDays = null,
     onProgress,
   } = {}
 ) {
-  const ids = (await con.runAndReadAll(`SELECT id FROM items WHERE type IN (1, 5) ORDER BY id`))
+  if (sinceDays != null && !(Number.isFinite(sinceDays) && sinceDays > 0)) {
+    throw new Error(`refreshLiveScores: sinceDays must be a positive number, got ${sinceDays}`);
+  }
+  const cutoff = sinceDays == null ? '' : `AND time >= now() - INTERVAL ${Number(sinceDays)} DAY`;
+  const ids = (
+    await con.runAndReadAll(`SELECT id FROM items WHERE type IN (1, 5) ${cutoff} ORDER BY id`)
+  )
     .getRows()
     .map((r) => Number(r[0]));
-  if (ids.length === 0) return { fetched: 0, updated: 0, missing: 0, failed: 0 };
+  const sinceDaysOut = sinceDays ?? null;
+  if (ids.length === 0) {
+    return { fetched: 0, updated: 0, missing: 0, failed: 0, sinceDays: sinceDaysOut };
+  }
 
   const live = [];
   let missing = 0;
@@ -231,13 +283,16 @@ export async function refreshLiveScores(
     WHERE items.id = l.id;
   `);
 
-  return { fetched: ids.length, updated: live.length, missing, failed };
+  return { fetched: ids.length, updated: live.length, missing, failed, sinceDays: sinceDaysOut };
 }
 
 /**
  * Split, clean, and enrich the source files into stories.parquet and
  * comments.parquet under `outDir`. Returns row counts and the share of comments
  * whose root story resolved (comments rooted before the window resolve to null).
+ *
+ * `sourceFiles` are the monthly files; `todayFiles` are the today/ files
+ * covering the gap since the last monthly commit, and may overlap them.
  *
  * `refreshScores` opts into the live HN score/comment refresh described above.
  * It defaults off so the ETL — and its tests — stay hermetic; the CLI turns it
@@ -247,9 +302,11 @@ export async function buildData(
   con,
   {
     sourceFiles,
+    todayFiles = [],
     outDir,
     types = [1, 2, 5],
     refreshScores = false,
+    refreshScoreDays = DEFAULT_SCORE_REFRESH_DAYS,
     startMonth,
     fetchImpl,
     onProgress,
@@ -262,7 +319,6 @@ export async function buildData(
   await mkdir(outDir, { recursive: true });
   const storiesPath = path.join(outDir, 'stories.parquet');
   const commentsPath = path.join(outDir, 'comments.parquet');
-  const src = readParquetExpr(sourceFiles);
   const typeList = types.join(', ');
 
   // The first hours of the window's first UTC day are still the previous month
@@ -272,43 +328,63 @@ export async function buildData(
   // The window's tail is short by the same offset for the opposite reason; that
   // costs the final month under 1% and is left alone rather than pulling down
   // another month of source data to square it off.
-  const trim = startMonth
-    ? `AND time >= timezone('${MODEL_TZ}', TIMESTAMP '${startMonth}-01 00:00:00')`
-    : '';
+  // The trim compares against the converted instant, so it means the same thing
+  // for both sources.
+  const trimFor = (timeExpr) =>
+    startMonth
+      ? `AND ${timeExpr} >= timezone('${MODEL_TZ}', TIMESTAMP '${startMonth}-01 00:00:00')`
+      : '';
 
-  // One working table: live items in the window, heavy columns dropped.
-  //
-  // The window can name the same item twice — a live block upstream had not yet
-  // cleared when it refetched that month's Parquet, or one committed between
-  // this build's two globs. The rows are copies of one item, so keeping
-  // whichever arrives first is enough; what matters is that it is one row, since
-  // a duplicate would inflate every count and average in the model.
-  await con.run(`
-    CREATE OR REPLACE TABLE items AS
+  // One projection, two sources. today/ stores `time` as a naive TIMESTAMP
+  // where the monthly files store an instant. openConnection pins the session
+  // zone to UTC, so a bare union_by_name read resolves it correctly today —
+  // but only because of that SET three functions away. Converting explicitly
+  // keeps the correctness local to the query: read under any other session
+  // zone, an unconverted naive value silently shifts by the offset.
+  const select = (files, rank, timeExpr) => `
     SELECT
+      ${rank}       AS source_rank,
       id,
       type,
       "by"          AS author,
-      time,
+      ${timeExpr}   AS time,
       parent,
       url,
       score,
       title,
       descendants,
       length(text)  AS text_len
-    FROM ${src}
+    FROM ${readParquetExpr(files)}
     WHERE coalesce(deleted, 0) = 0
       AND coalesce(dead, 0) = 0
       AND type IN (${typeList})
-      ${trim}
-    QUALIFY row_number() OVER (PARTITION BY id) = 1;
+      ${trimFor(timeExpr)}
+  `;
+
+  const sources = [select(sourceFiles, 0, 'time')];
+  if (todayFiles.length) sources.push(select(todayFiles, 1, `timezone('UTC', time)`));
+
+  // One working table: live items in the window, heavy columns dropped.
+  //
+  // The window can name the same item twice — a live block upstream had not yet
+  // cleared when it refetched that month's Parquet, or one committed between
+  // this build's two globs. The rows are copies of one item, so exactly one has
+  // to survive: a duplicate would inflate every count and average in the model.
+  // `source_rank` decides which, rather than leaving it to whichever row the
+  // scan happens to reach first — the monthly row is the committed one, so a
+  // rebuild from the same window is reproducible.
+  await con.run(`
+    CREATE OR REPLACE TABLE items AS
+    WITH raw AS (${sources.join('\n    UNION ALL\n')})
+    SELECT * FROM raw
+    QUALIFY row_number() OVER (PARTITION BY id ORDER BY source_rank) = 1;
   `);
 
   // Before anything is written: replace the ingest-time score/comment snapshots
   // with current values, so every downstream aggregate measures reception
   // rather than the first few minutes after posting.
   const refreshed = refreshScores
-    ? await refreshLiveScores(con, { fetchImpl, onProgress })
+    ? await refreshLiveScores(con, { fetchImpl, onProgress, sinceDays: refreshScoreDays })
     : null;
 
   // Stories (and jobs): derive domain and a human category.
@@ -375,7 +451,8 @@ export async function buildData(
       SELECT
         (SELECT count(*) FROM items WHERE type IN (1,5))                                    AS stories,
         (SELECT count(*) FROM items WHERE type = 2)                                         AS comments,
-        (SELECT count(*) FROM root_map)                                                     AS resolved
+        (SELECT count(*) FROM root_map)                                                     AS resolved,
+        (SELECT count(*) FROM items WHERE source_rank = 1)                                  AS from_today
     `)
   ).getRowObjects()[0];
 
@@ -387,49 +464,88 @@ export async function buildData(
     comments,
     resolved,
     resolutionRate: comments === 0 ? 1 : resolved / comments,
+    fromToday: Number(stats.from_today),
     refreshed,
     storiesPath,
     commentsPath,
   };
 }
 
+/** ETL settings from the environment. Shared so the CLI and the scheduled
+ *  refresh cannot drift apart on defaults. */
+export function envConfig() {
+  return {
+    months: Number(process.env.HN_MONTHS || DEFAULT_MONTHS),
+    end: process.env.HN_END || undefined,
+    types: (process.env.HN_TYPES || '1,2,5').split(',').map((t) => Number(t.trim())),
+    refreshScores: process.env.HN_REFRESH_SCORES !== '0',
+    refreshScoreDays: Number(process.env.HN_REFRESH_SCORES_DAYS || DEFAULT_SCORE_REFRESH_DAYS),
+  };
+}
+
+/**
+ * A connection for a real build: disk-backed, so a multi-year window's working
+ * set spills instead of sitting in RAM. Returns the connection and a cleanup
+ * that removes the scratch database.
+ */
+export async function openBuildConnection() {
+  const scratchDir = process.env.HN_SCRATCH || path.join(tmpdir(), 'hn-etl');
+  await rm(scratchDir, { recursive: true, force: true });
+  await mkdir(scratchDir, { recursive: true });
+  const con = await openConnection({
+    dbPath: path.join(scratchDir, 'etl.duckdb'),
+    tempDir: scratchDir,
+    memoryLimit: process.env.HN_DUCKDB_MEMORY || undefined,
+  });
+  return { con, cleanup: () => rm(scratchDir, { recursive: true, force: true }) };
+}
+
+/** The `.metadata.json` the app reads to describe the slice it is serving. */
+export const metadataFor = ({ startMonth, endMonth, months, stats }) =>
+  JSON.stringify({
+    refreshedAt: new Date().toISOString(),
+    scoresRefreshed: Boolean(stats.refreshed),
+    scoreRefreshDays: stats.refreshed?.sinceDays ?? null,
+    windowMonths: months,
+    startMonth,
+    endMonth,
+    fromToday: stats.fromToday,
+  }) + '\n';
+
 // ── CLI ────────────────────────────────────────────────────────────────────
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  const months = Number(process.env.HN_MONTHS || 12);
-  const end = process.env.HN_END || undefined;
-  const types = (process.env.HN_TYPES || '1,2,5').split(',').map((t) => Number(t.trim()));
+  const { months, end, types, refreshScores, refreshScoreDays } = envConfig();
   const outDir = process.env.HN_OUT || path.resolve('package/data');
 
-  const con = await openConnection();
+  const { con, cleanup } = await openBuildConnection();
   console.log(`[prep] resolving window: ${months} month(s)${end ? ` ending ${end}` : ' ending latest'}`);
-  const { files, liveFiles, startMonth, endMonth } = await resolveSourceFiles(con, { months, end });
+  const { monthly, todayFiles, startMonth, endMonth } = await resolveSourceFiles(con, { months, end });
   console.log(
-    `[prep] window ${startMonth}..${endMonth} — ${files.length - liveFiles} monthly file(s)` +
-      ` + ${liveFiles} live block(s) for today`
+    `[prep] window ${startMonth}..${endMonth} — ${monthly.length} monthly file(s)` +
+      ` + ${todayFiles.length} live block(s) for today`
   );
   console.log('[prep] building (downloads + ETL; this can take a while on wide windows)…');
   const t0 = Date.now();
-  const refreshScores = process.env.HN_REFRESH_SCORES !== '0';
-  if (refreshScores) console.log('[prep] will refresh scores/comment counts from the HN API');
+  if (refreshScores) {
+    console.log(`[prep] will refresh scores/comment counts from the HN API (last ${refreshScoreDays} days)`);
+  }
   const stats = await buildData(con, {
-    sourceFiles: files,
+    sourceFiles: monthly,
+    todayFiles,
     outDir,
     types,
     refreshScores,
+    refreshScoreDays,
     startMonth,
     onProgress: (done, total) => console.log(`[prep]   live refresh ${done}/${total}`),
   });
+  await cleanup();
   // Marker the container entrypoint reads to decide whether to re-fetch on boot.
   await writeFile(path.join(outDir, '.window'), `${months}:${end || 'latest'}\n`);
   await writeFile(
     path.join(outDir, '.metadata.json'),
-    JSON.stringify({
-      refreshedAt: new Date().toISOString(),
-      scoresRefreshed: refreshScores,
-      startMonth,
-      endMonth,
-    }) + '\n'
+    metadataFor({ startMonth, endMonth, months, stats })
   );
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(
@@ -437,8 +553,10 @@ if (isMain) {
       `[prep]   stories:  ${stats.stories.toLocaleString()}\n` +
       `[prep]   comments: ${stats.comments.toLocaleString()} ` +
       `(root story resolved: ${(stats.resolutionRate * 100).toFixed(1)}%)` +
+      (stats.fromToday ? `\n[prep]   from today/: ${stats.fromToday.toLocaleString()} item(s) not yet in a monthly file` : '') +
       (stats.refreshed
-        ? `\n[prep]   live scores: ${stats.refreshed.updated.toLocaleString()} refreshed, ` +
+        ? `\n[prep]   live scores: ${stats.refreshed.updated.toLocaleString()} refreshed` +
+          `${stats.refreshed.sinceDays ? ` (last ${stats.refreshed.sinceDays} days; older keep upstream values)` : ''}, ` +
           `${stats.refreshed.missing.toLocaleString()} gone from the API, ${stats.refreshed.failed} failed`
         : '\n[prep]   live scores: skipped (HN_REFRESH_SCORES=0) — scores are ingest-time snapshots')
   );

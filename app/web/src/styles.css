@@ -192,7 +192,10 @@ body {
 }
 .dataset-note { margin: 18px 0 0; font-size: 13px; align-items: center; }
 .modal-dataset { margin: 10px 0 0; font-size: 13px; align-items: flex-start; }
-.dataset-stats { display: flex; flex-wrap: wrap; gap: 2px 14px; justify-content: center; }
+.dataset-stats { display: flex; flex-wrap: wrap; gap: 2px 14px; }
+/* Centred under the empty state's centred column; left-aligned in the modal,
+   where it sits in a column of left-aligned prose. */
+.dataset-note .dataset-stats { justify-content: center; }
 /* Stats never break internally, and the dot rides with the stat before it so a
    wrapped line never starts with a separator. */
 .dataset-stats > * { white-space: nowrap; }
@@ -502,9 +505,12 @@ button.hood-step:hover { background: var(--inline-code-bg); color: var(--ink); }
 .composer .stop-btn { background: var(--panel); color: var(--ink); border: 1px solid var(--border-strong); }
 .composer .stop-btn:hover { border-color: var(--hn-orange); color: var(--hn-orange); }
 
-/* How-it-works modal */
+/* How-it-works modal. The z-index clears @malloydata/render's own layers —
+   its sticky table header is 100 and its tooltip 10000 — which otherwise paint
+   through the backdrop, since nothing around the result card opens a stacking
+   context to contain them. */
 .modal-backdrop {
-  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+  position: fixed; inset: 0; z-index: 10050; display: grid; place-items: center;
   padding: 24px; background: rgba(16, 18, 22, 0.42); backdrop-filter: blur(2px);
   animation: fade 0.12s ease-out;
 }

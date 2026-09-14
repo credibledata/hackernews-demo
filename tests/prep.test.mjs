@@ -4,7 +4,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { quotedString } from '@duckdb/node-api';
@@ -91,15 +91,20 @@ test('prep splits, derives, and resolves root stories', async () => {
 // the current values back from the HN API. Every test here injects its own
 // fetch — the ETL must stay hermetic.
 
-/** Build a minimal `items` table with the columns refreshLiveScores touches. */
+/** Build a minimal `items` table with the columns refreshLiveScores touches.
+ *  `ageDays` places a row relative to now, for the recency cutoff. */
 async function seedItems(con, rows) {
   await con.run(`
     CREATE OR REPLACE TABLE items (
-      id BIGINT, type INTEGER, score INTEGER, descendants INTEGER
+      id BIGINT, type INTEGER, score INTEGER, descendants INTEGER, time TIMESTAMPTZ
     );
   `);
   const values = rows
-    .map((r) => `(${r.id}, ${r.type}, ${r.score ?? 'NULL'}, ${r.descendants ?? 'NULL'})`)
+    .map(
+      (r) =>
+        `(${r.id}, ${r.type}, ${r.score ?? 'NULL'}, ${r.descendants ?? 'NULL'},` +
+        ` now() - INTERVAL ${Number(r.ageDays ?? 0)} DAY)`
+    )
     .join(', ');
   if (values) await con.run(`INSERT INTO items VALUES ${values};`);
 }
@@ -279,6 +284,9 @@ test('buildData wires the refresh through to stories.parquet', async () => {
       sourceFiles: [fixture],
       outDir: dir,
       refreshScores: true,
+      // This fixture is dated 2024; the point here is the wiring, so opt out of
+      // the recency cutoff rather than date the rows relative to now.
+      refreshScoreDays: null,
       fetchImpl: fakeApi({
         1: { score: 900, descendants: 450 },
         2: { score: 800, descendants: 350 },
@@ -415,6 +423,133 @@ test('buildData keeps one row per item when a live block repeats it', async () =
       .getRows()
       .map((r) => Number(r[0]));
     assert.deepEqual(ids, [1, 2, 3], 'one row per story id');
+  } finally {
+    con.closeSync?.();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── The today/ incremental feed ─────────────────────────────────────────────
+// Upstream commits whole months to data/ and everything since the last monthly
+// commit to today/. Without today/, the slice is stale by however long it has
+// been since that commit — up to a month. Two wrinkles make this more than a
+// wider glob: ids overlap between the two (today/ retains rows the monthly file
+// has since absorbed), and today/'s `time` is a naive TIMESTAMP where the
+// monthly files carry TIMESTAMP WITH TIME ZONE.
+
+/** Write `rows` (a VALUES clause) to a Parquet fixture and return its path. */
+async function fixture(con, dir, name, rows) {
+  const file = path.join(dir, name);
+  await con.run(
+    `COPY (SELECT * FROM (${rows}) AS t${FIXTURE_COLS}) TO ${quotedString(file)} (FORMAT parquet);`
+  );
+  return file;
+}
+
+// Monthly files store an instant; today/ stores a naive wall clock in UTC.
+const monthlyStory = (id, by, at, title, score) =>
+  `(${id}, 0, 1, '${by}', TIMESTAMPTZ '${at}', CAST(NULL AS VARCHAR), 0, NULL, CAST(NULL AS VARCHAR), ${score}, '${title}', 0)`;
+const todayStory = (id, by, at, title, score) =>
+  `(${id}, 0, 1, '${by}', TIMESTAMP '${at}', CAST(NULL AS VARCHAR), 0, NULL, CAST(NULL AS VARCHAR), ${score}, '${title}', 0)`;
+const todayComment = (id, by, at, parent) =>
+  `(${id}, 0, 2, '${by}', TIMESTAMP '${at}', 'reply', 0, ${parent}, CAST(NULL AS VARCHAR), CAST(NULL AS INTEGER), CAST(NULL AS VARCHAR), 0)`;
+
+test('buildData picks up items the monthly files have not committed yet', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hn-prep-today-'));
+  const con = await openConnection();
+  try {
+    const monthly = await fixture(
+      con,
+      dir,
+      'monthly.parquet',
+      `VALUES
+        ${monthlyStory(1, 'alice', '2024-01-10 18:00:00+00', 'Committed', 50)},
+        ${monthlyStory(2, 'bob', '2024-01-20 18:00:00+00', 'Also committed', 60)}`
+    );
+    // 30/31 are past the monthly cutoff; 2 is a stale duplicate the monthly
+    // file already carries, at the score it had when today/ captured it.
+    const today = await fixture(
+      con,
+      dir,
+      'today.parquet',
+      `VALUES
+        ${todayStory(2, 'bob', '2024-01-20 18:00:00', 'Also committed', 3)},
+        ${todayStory(30, 'carol', '2024-02-01 18:00:00', 'Not yet committed', 12)},
+        ${todayComment(31, 'dave', '2024-02-01 18:30:00', 30)}`
+    );
+
+    const stats = await buildData(con, {
+      sourceFiles: [monthly],
+      todayFiles: [today],
+      outDir: dir,
+    });
+
+    assert.equal(stats.stories, 3, 'the uncommitted story joins the two monthly ones');
+    assert.equal(stats.comments, 1, 'and its reply comes with it');
+    assert.equal(stats.fromToday, 2, 'stats report what today/ contributed');
+
+    const stories = Object.fromEntries(
+      (
+        await con.runAndReadAll(
+          `SELECT id, score FROM read_parquet(${quotedString(stats.storiesPath)})`
+        )
+      )
+        .getRowObjects()
+        .map((r) => [Number(r.id), Number(r.score)])
+    );
+    assert.deepEqual(Object.keys(stories).map(Number).sort((a, b) => a - b), [1, 2, 30]);
+    assert.equal(stories[2], 60, 'a duplicated id keeps the monthly row, not the stale today/ one');
+    assert.equal(stories[30], 12, 'the uncommitted story keeps its own score');
+
+    const roots = (
+      await con.runAndReadAll(
+        `SELECT id, root_story_id FROM read_parquet(${quotedString(stats.commentsPath)})`
+      )
+    ).getRowObjects();
+    assert.equal(Number(roots[0].root_story_id), 30, 'a today/ comment roots to its today/ story');
+  } finally {
+    con.closeSync?.();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// today/'s `time` has no zone. Read as anything but UTC it shifts by hours,
+// which silently moves items across the window edge and across every hour and
+// day-of-week bucket the model reports.
+test('buildData reads the naive today/ timestamps as UTC', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hn-prep-today-tz-'));
+  const con = await openConnection();
+  try {
+    const monthly = await fixture(
+      con,
+      dir,
+      'monthly.parquet',
+      `VALUES ${monthlyStory(1, 'alice', '2024-01-15 18:00:00+00', 'In window', 50)}`
+    );
+    // 08:00Z is exactly 2024-01-01 00:00 Pacific — the first instant of the
+    // window. 03:00Z is 2023-12-31 19:00 Pacific, so it must be trimmed.
+    const today = await fixture(
+      con,
+      dir,
+      'today.parquet',
+      `VALUES
+        ${todayStory(40, 'early', '2024-01-01 03:00:00', 'Dec in Pacific', 10)},
+        ${todayStory(41, 'ontime', '2024-01-01 08:00:00', 'Jan boundary', 10)}`
+    );
+
+    const stats = await buildData(con, {
+      sourceFiles: [monthly],
+      todayFiles: [today],
+      outDir: dir,
+      startMonth: '2024-01',
+    });
+
+    const ids = (
+      await con.runAndReadAll(`SELECT id FROM read_parquet(${quotedString(stats.storiesPath)}) ORDER BY id`)
+    )
+      .getRowObjects()
+      .map((r) => Number(r.id));
+    assert.deepEqual(ids, [1, 41], 'the pre-window today/ row is trimmed, the boundary row kept');
   } finally {
     con.closeSync?.();
     await rm(dir, { recursive: true, force: true });
