@@ -13,7 +13,7 @@ import type { Dataset } from './api';
 const MALLOY_REPO = 'https://github.com/malloydata/malloy';
 const PUBLISHER_REPO = 'https://github.com/malloydata/publisher';
 const MODEL_SOURCE_URL =
-  'https://github.com/credibledata/demos/blob/main/hn-demo/package/hn.malloy';
+  'https://github.com/credibledata/hackernews-demo/blob/main/package/hn.malloy';
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])';

@@ -8,7 +8,7 @@
 // SSE event kinds:
 //   token   { text }                     incremental answer text
 //   status  { kind, detail }             "querying"/"thinking" indicators
-//   result  { malloyQuery, sql, data, steps, primary }
+//   result  { malloyQuery, sql, data, followUps, steps, primary }
 //                                        the work behind the answer: every step
 //                                        the agent took, and the one the answer
 //                                        rests on (repeated at the top level)
@@ -21,6 +21,7 @@ import { config } from './config.mjs';
 import { connectMcp } from './mcp.mjs';
 import { streamChat } from './agent.mjs';
 import { buildTrace } from './trace.mjs';
+import { followUpsFor } from './followups.mjs';
 import { getDataset } from './dataset.mjs';
 import { getModelSource } from './model.mjs';
 import { createRateLimiter } from './ratelimit.mjs';
@@ -219,6 +220,7 @@ app.post('/chat/message', async (req, res) => {
           sql: lead.sql,
           data: lead.data,
           interpretation: lead.interpretation,
+          followUps: followUpsFor(lead.detail),
           steps: trace.steps,
           primary: trace.primary,
         };

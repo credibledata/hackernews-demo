@@ -1,10 +1,10 @@
 // Build the curated Hacker News Parquet slice the Malloy model reads.
 //
-// Reads the open-index/hacker-news dataset (Parquet on Hugging Face, one file
-// per month) for a configurable lookback window, splits it into `stories` and
-// `comments`, derives a few fields that are expensive to compute at query time
-// (domain, category, and each comment's root story id), and writes two local
-// Parquet files.
+// Reads the open-index/hacker-news dataset (Parquet on Hugging Face: one file
+// per month under data/, plus 5-minute live blocks for today under today/) for a
+// configurable lookback window, splits it into `stories` and `comments`, derives
+// a few fields that are expensive to compute at query time (domain, category,
+// and each comment's root story id), and writes two local Parquet files.
 //
 // Config (env, read by the CLI at the bottom):
 //   HN_MONTHS  how many months back from HN_END          (default 12)
@@ -26,8 +26,15 @@ import { DuckDBInstance, quotedString } from '@duckdb/node-api';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-const HF_GLOB = 'hf://datasets/open-index/hacker-news/data/*/*.parquet';
+const HF_REPO = 'hf://datasets/open-index/hacker-news';
+const HF_MONTHLY_GLOB = `${HF_REPO}/data/*/*.parquet`;
+// Upstream commits new items as 5-minute blocks under today/ and only folds them
+// into the month's Parquet at midnight UTC, so the monthly files on their own
+// are up to a day behind and never carry today at all. Path shape is
+// today/YYYY/MM/DD/HH/MM.parquet.
+const HF_LIVE_GLOB = `${HF_REPO}/today/*/*/*/*/*.parquet`;
 const MONTH_RE = /(\d{4})-(\d{2})\.parquet$/;
+const LIVE_MONTH_RE = /\/today\/(\d{4})\/(\d{2})\//;
 
 /** Open a DuckDB connection with httpfs loaded (needed for hf:// reads). */
 export async function openConnection() {
@@ -50,36 +57,81 @@ const monthIndex = (m) => {
   return y * 12 + (mo - 1);
 };
 
-/**
- * List the Hugging Face monthly files that fall inside the lookback window.
- * Globs the dataset (a metadata call, not a data download), so a month that
- * doesn't exist yet is simply absent rather than a hard error.
- */
-export async function resolveSourceFiles(con, { months = 12, end } = {}) {
-  const reader = await con.runAndReadAll(
-    `SELECT file FROM glob(${quotedString(HF_GLOB)}) ORDER BY file`
-  );
-  const available = reader
-    .getRows()
-    .map((row) => String(row[0]))
-    .map((file) => ({ file, month: (file.match(MONTH_RE) || [])[0]?.replace('.parquet', '') }))
-    .filter((x) => x.month)
-    .sort((a, b) => a.month.localeCompare(b.month));
+/** The calendar month ("YYYY-MM") a source file belongs to, or null. */
+function monthOf(file) {
+  const monthly = file.match(MONTH_RE);
+  if (monthly) return `${monthly[1]}-${monthly[2]}`;
+  const live = file.match(LIVE_MONTH_RE);
+  return live ? `${live[1]}-${live[2]}` : null;
+}
 
+const byMonth = (files) =>
+  files
+    .map((file) => ({ file, month: monthOf(file) }))
+    .filter((x) => x.month)
+    .sort((a, b) => a.month.localeCompare(b.month) || a.file.localeCompare(b.file));
+
+/**
+ * Pick the source files inside the lookback window: the monthly Parquet files,
+ * plus the live blocks for the window's final month.
+ *
+ * Only the final month, because that is the only month a live block can add
+ * anything to. Upstream is supposed to clear a day's blocks once it has folded
+ * them into that month's Parquet, but it does not always manage it — the repo
+ * currently still carries blocks from April, May and June, months consolidated
+ * long ago — and every one of those is a row we already have.
+ *
+ * The same cut drops them whenever the window ends before today: HN_END pinning
+ * it to a past month, or the first of a month before upstream has written the
+ * new month's Parquet, where taking the blocks would grow a trailing bucket
+ * holding a few hours against full months either side of it.
+ */
+export function selectSourceFiles(monthlyFiles, liveFiles, { months = 12, end } = {}) {
+  const available = byMonth(monthlyFiles);
   if (available.length === 0) {
-    throw new Error(`No dataset files found at ${HF_GLOB}`);
+    throw new Error(`No dataset files found at ${HF_MONTHLY_GLOB}`);
   }
   const endMonth = end || available[available.length - 1].month;
   const endIdx = monthIndex(endMonth);
   const startIdx = endIdx - (months - 1);
-  const picked = available.filter((x) => {
-    const idx = monthIndex(x.month);
-    return idx >= startIdx && idx <= endIdx;
-  });
+  const inWindow = (month) => monthIndex(month) >= startIdx && monthIndex(month) <= endIdx;
+
+  const picked = available.filter((x) => inWindow(x.month));
   if (picked.length === 0) {
     throw new Error(`No files in window ${months}mo ending ${endMonth}`);
   }
-  return { files: picked.map((x) => x.file), endMonth, startMonth: picked[0].month };
+  const live = byMonth(liveFiles).filter((x) => x.month === endMonth);
+
+  return {
+    files: [...picked.map((x) => x.file), ...live.map((x) => x.file)],
+    liveFiles: live.length,
+    endMonth,
+    startMonth: picked[0].month,
+  };
+}
+
+const globFiles = async (con, pattern) =>
+  (await con.runAndReadAll(`SELECT file FROM glob(${quotedString(pattern)}) ORDER BY file`))
+    .getRows()
+    .map((row) => String(row[0]));
+
+/**
+ * List the Hugging Face files that fall inside the lookback window. Globs the
+ * dataset (a metadata call, not a data download), so a month that doesn't exist
+ * yet is simply absent rather than a hard error.
+ */
+export async function resolveSourceFiles(con, { months = 12, end } = {}) {
+  const [monthlyFiles, liveFiles] = await Promise.all([
+    globFiles(con, HF_MONTHLY_GLOB),
+    // today/ is empty for a moment after each midnight roll, and absent
+    // entirely on a mirror that doesn't publish live blocks. Neither is a
+    // reason to fail the build — but say so, since it costs freshness.
+    globFiles(con, HF_LIVE_GLOB).catch((e) => {
+      console.warn(`[prep] no live blocks (${e?.message || e}) — monthly files only`);
+      return [];
+    }),
+  ]);
+  return selectSourceFiles(monthlyFiles, liveFiles, { months, end });
 }
 
 /** Build a `read_parquet([...])` expression from a list of file paths/urls. */
@@ -225,6 +277,12 @@ export async function buildData(
     : '';
 
   // One working table: live items in the window, heavy columns dropped.
+  //
+  // The window can name the same item twice — a live block upstream had not yet
+  // cleared when it refetched that month's Parquet, or one committed between
+  // this build's two globs. The rows are copies of one item, so keeping
+  // whichever arrives first is enough; what matters is that it is one row, since
+  // a duplicate would inflate every count and average in the model.
   await con.run(`
     CREATE OR REPLACE TABLE items AS
     SELECT
@@ -242,7 +300,8 @@ export async function buildData(
     WHERE coalesce(deleted, 0) = 0
       AND coalesce(dead, 0) = 0
       AND type IN (${typeList})
-      ${trim};
+      ${trim}
+    QUALIFY row_number() OVER (PARTITION BY id) = 1;
   `);
 
   // Before anything is written: replace the ingest-time score/comment snapshots
@@ -344,8 +403,11 @@ if (isMain) {
 
   const con = await openConnection();
   console.log(`[prep] resolving window: ${months} month(s)${end ? ` ending ${end}` : ' ending latest'}`);
-  const { files, startMonth, endMonth } = await resolveSourceFiles(con, { months, end });
-  console.log(`[prep] window ${startMonth}..${endMonth} — ${files.length} monthly file(s)`);
+  const { files, liveFiles, startMonth, endMonth } = await resolveSourceFiles(con, { months, end });
+  console.log(
+    `[prep] window ${startMonth}..${endMonth} — ${files.length - liveFiles} monthly file(s)` +
+      ` + ${liveFiles} live block(s) for today`
+  );
   console.log('[prep] building (downloads + ETL; this can take a while on wide windows)…');
   const t0 = Date.now();
   const refreshScores = process.env.HN_REFRESH_SCORES !== '0';

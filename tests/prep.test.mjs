@@ -8,7 +8,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { quotedString } from '@duckdb/node-api';
-import { openConnection, buildData, refreshLiveScores } from '../prep/build-data.mjs';
+import {
+  openConnection,
+  buildData,
+  refreshLiveScores,
+  selectSourceFiles,
+} from '../prep/build-data.mjs';
 
 // One row per HN item. Columns mirror the real dataset (subset we use).
 // Chains:  10->1, 11->10->1, 12->2   ; 13->999 (outside) ; deleted/dead excluded.
@@ -313,6 +318,103 @@ test('buildData does not touch the network unless asked', async () => {
       fetchImpl: () => assert.fail('buildData fetched with refreshScores off'),
     });
     assert.equal(stats.refreshed, null);
+  } finally {
+    con.closeSync?.();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Source-file selection ───────────────────────────────────────────────────
+// Upstream commits new items as 5-minute blocks under today/ and only folds
+// them into the month's Parquet at midnight UTC, so a build that reads only
+// data/*/*.parquet is always up to a day behind and never sees today at all.
+// Live blocks are picked by the same window rule as the monthly files, which is
+// what keeps them honest: they are only ever today's, so they extend the tail
+// of the final month and drop out whenever the window ends before today.
+
+const monthlyFile = (month) =>
+  `hf://datasets/open-index/hacker-news/data/${month.slice(0, 4)}/${month}.parquet`;
+const liveFile = (y, m, d, h, min) =>
+  `hf://datasets/open-index/hacker-news/today/${y}/${m}/${d}/${h}/${min}.parquet`;
+
+const MONTHS = ['2026-05', '2026-06', '2026-07', '2026-08'].map(monthlyFile);
+const LIVE = [liveFile('2026', '08', '22', '23', '55'), liveFile('2026', '08', '23', '16', '00')];
+
+test('selectSourceFiles appends live blocks that fall inside the window', () => {
+  const picked = selectSourceFiles(MONTHS, LIVE, { months: 2 });
+
+  assert.equal(picked.endMonth, '2026-08', 'window ends at the newest monthly file');
+  assert.equal(picked.startMonth, '2026-07');
+  assert.equal(picked.liveFiles, 2, 'both August blocks are in the window');
+  assert.deepEqual(picked.files, [monthlyFile('2026-07'), monthlyFile('2026-08'), ...LIVE]);
+});
+
+test('selectSourceFiles leaves out live blocks when the window ends earlier', () => {
+  // HN_END pins the window to a past month: today's blocks are not in it.
+  const picked = selectSourceFiles(MONTHS, LIVE, { months: 2, end: '2026-06' });
+
+  assert.equal(picked.liveFiles, 0);
+  assert.deepEqual(picked.files, [monthlyFile('2026-05'), monthlyFile('2026-06')]);
+});
+
+test('selectSourceFiles leaves out live blocks from a month with no monthly file yet', () => {
+  // The first of the month, before upstream has written the new month's
+  // Parquet. Taking September's blocks here would grow a trailing month bucket
+  // holding a few hours against full months either side of it.
+  const september = [liveFile('2026', '09', '01', '04', '10')];
+  const picked = selectSourceFiles(MONTHS, september, { months: 2 });
+
+  assert.equal(picked.liveFiles, 0);
+  assert.equal(picked.endMonth, '2026-08');
+});
+
+test('selectSourceFiles leaves out orphaned blocks from a consolidated month', () => {
+  // Upstream is meant to clear a day's blocks once that month's Parquet absorbs
+  // them, and does not always manage it — the repo still carries April blocks
+  // months later. Those items are already in the monthly file.
+  const orphans = [liveFile('2026', '06', '14', '09', '05'), ...LIVE];
+  const picked = selectSourceFiles(MONTHS, orphans, { months: 4 });
+
+  assert.equal(picked.startMonth, '2026-05', 'June is inside the window');
+  assert.equal(picked.liveFiles, 2, 'only the final month contributes blocks');
+  assert.deepEqual(picked.files.slice(-2), LIVE);
+});
+
+test('selectSourceFiles still works when today/ is empty', () => {
+  const picked = selectSourceFiles(MONTHS, [], { months: 1 });
+  assert.deepEqual(picked.files, [monthlyFile('2026-08')]);
+  assert.equal(picked.liveFiles, 0);
+});
+
+test('buildData keeps one row per item when a live block repeats it', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hn-prep-dup-'));
+  const con = await openConnection();
+  try {
+    // A block upstream had not yet cleared when the month was refetched: the
+    // same item arrives from both files. Counting it twice would inflate every
+    // aggregate in the model.
+    const monthly = path.join(dir, 'month.parquet');
+    const block = path.join(dir, 'block.parquet');
+    await con.run(
+      `COPY (SELECT * FROM (${FIXTURE_ROWS}) AS t${FIXTURE_COLS}) TO ${quotedString(monthly)} (FORMAT parquet);`
+    );
+    await con.run(
+      `COPY (SELECT * FROM (${FIXTURE_ROWS}) AS t${FIXTURE_COLS} WHERE id IN (2, 12))
+         TO ${quotedString(block)} (FORMAT parquet);`
+    );
+
+    const stats = await buildData(con, { sourceFiles: [monthly, block], outDir: dir });
+
+    assert.equal(stats.stories, 3, 'story 2 is not counted twice');
+    assert.equal(stats.comments, 4, 'comment 12 is not counted twice');
+    const ids = (
+      await con.runAndReadAll(
+        `SELECT id FROM read_parquet(${quotedString(stats.storiesPath)}) ORDER BY id`
+      )
+    )
+      .getRows()
+      .map((r) => Number(r[0]));
+    assert.deepEqual(ids, [1, 2, 3], 'one row per story id');
   } finally {
     con.closeSync?.();
     await rm(dir, { recursive: true, force: true });

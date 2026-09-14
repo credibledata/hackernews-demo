@@ -116,6 +116,15 @@ has to pick a score tier and say which). Each answer states the definition it us
 from a second model call — so the point of a semantic layer shows up on the first
 click instead of being explained.
 
+The "Try next" chips under an answer are not fixed: `app/server/followups.mjs`
+maps the query that answered — a named view, or the fields a custom query reached
+for — to two adjacent cuts of the same model, so an answer about the best hour is
+followed by the day-of-week cut and by when comments arrive. It rides the same
+payload as the interpretation line, and for the same reason: a question derived
+from the model can always be answered, where a generated one can ask for
+something this slice does not hold. A query matching nothing falls back to the
+starters.
+
 ## Configuring the data window
 
 `prep/build-data.mjs` reads a configurable lookback window (env vars):
@@ -128,11 +137,41 @@ click instead of being explained.
 | `HN_REFRESH_SCORES` | `1` | Re-read scores and comment counts from the HN API; `0` skips it |
 | `HN_REFRESH_CONCURRENCY` | `50` | In-flight HN API requests during that refresh |
 
+The window is built from the dataset's monthly Parquet files plus the 5-minute
+live blocks it publishes for today. Upstream only folds those blocks into the
+month's file at midnight UTC, so reading the monthly files alone leaves the slice
+up to a day behind. Live blocks are only taken when they fall inside the window,
+which means `HN_END` still pins it to whole past months.
+
 - **At build time:** `docker build --build-arg HN_MONTHS=6 ...` bakes that window
   into the image.
 - **At boot (hybrid):** set `HN_MONTHS`/`HN_END` and `HN_REFETCH=1` on the
   container; if they differ from the baked window, it re-fetches from Hugging Face
   before serving.
+
+### Keeping it current
+
+The container rebuilds the slice on a schedule and hot-swaps it in without a
+restart: `prep/refresh.mjs` builds into a new versioned directory, validates it,
+flips the `package/data` symlink atomically, and asks Publisher to reload. A
+failed run leaves the current data serving.
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `HN_REFRESH` | `1` | Run the scheduled refresh; `0` disables it |
+| `HN_REFRESH_INTERVAL` | `86400` | Seconds between refreshes, and how old data must be before a run rebuilds it |
+
+The loop checks at boot and then every interval, so a container that restarts
+more often than the interval still refreshes; a run that finds data younger than
+the interval exits without building. `node prep/refresh.mjs --force` rebuilds
+regardless. This needs a container that keeps running between requests — on a
+host that stops it when idle, drive the refresh from an external scheduler
+instead.
+
+Freshness is bounded by the upstream dataset, not by this loop: if
+`open-index/hacker-news` stops publishing, the slice stops advancing and the
+window shown in the UI is the honest report of that. Check the dataset's commit
+history before treating a stale window as a bug here.
 
 A wider window means richer trends and denser comment→story joins, but a larger
 image and longer build. Comments whose root story predates the window resolve to a

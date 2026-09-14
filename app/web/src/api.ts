@@ -34,6 +34,9 @@ export type UnderTheHood = {
   cached?: boolean;
   // Deterministic explanation of the governed semantics used by the query.
   interpretation?: string;
+  // Two questions adjacent to this query in the model, for the "Try next" row.
+  // Empty when the query matched nothing the model can follow up on.
+  followUps?: string[];
 };
 
 export type ChatHandlers = {

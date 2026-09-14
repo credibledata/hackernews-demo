@@ -64,6 +64,15 @@ Use the tools extensively. A good turn uses several tool calls before answering:
 6. RUN — call malloy_executeQuery. Always pass a full "query" string (not a
    queryName) so the query is visible to the user.
 
+   Mind your own limit. A result carrying as many rows as the "limit:" you asked
+   for is one page of the matches, not all of them — and it comes back with
+   _limit_hit false, because that flag reports the server's own cap, never yours.
+   Never conclude "there is no such story" from a page like that. Before saying
+   anything is absent from the data, count it: run the same filter with
+   "aggregate: story_count" and no limit. And when the question is about a recent
+   thing, order recent-first ("order_by: time desc") — an ascending order under a
+   limit hands you the oldest matches, the opposite of what was asked.
+
 7. ANSWER — in prose. Lead with the direct answer and key numbers, then one short
    supporting sentence. Be concise; do not restate the query or narrate tool use.
    A comparison ("unusually high?", "more than X?") needs its baseline in the

@@ -13,9 +13,14 @@
 //      and finish consistently against the old data.
 //
 // Requires the symlink layout (`package/data` -> `data.vN`); the container
-// entrypoint normalizes to it at boot. Run on a schedule (see entrypoint.sh).
+// entrypoint normalizes to it at boot.
+//
+// The entrypoint runs this once at boot and then every HN_REFRESH_INTERVAL, so
+// that a container which never lives a full interval — a restart loop, or a host
+// that stops it between requests — still refreshes. A run whose data is younger
+// than the interval exits without building; `--force` overrides that.
 
-import { readlink, symlink, rename, rm, readdir, writeFile, stat, mkdir } from 'node:fs/promises';
+import { readlink, symlink, rename, rm, readdir, writeFile, stat, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { openConnection, resolveSourceFiles, buildData } from './build-data.mjs';
 
@@ -23,6 +28,9 @@ const PACKAGE_DIR = path.resolve(process.env.HN_PACKAGE_DIR || 'package');
 const DATA_LINK = path.join(PACKAGE_DIR, 'data');
 const LOCK_DIR = path.join(PACKAGE_DIR, '.refresh.lock');
 const LOCK_STALE_MS = 60 * 60 * 1000; // a build well under an hour; older = crashed run
+// Also how old data has to be before a run rebuilds it: the period the container
+// refreshes on and "old enough to be worth rebuilding" are the same number.
+const INTERVAL_MS = Number(process.env.HN_REFRESH_INTERVAL || 86400) * 1000;
 
 const restUrl = process.env.PUBLISHER_REST_URL || 'http://127.0.0.1:4000/api/v0';
 const envName = process.env.HN_ENV || 'hn';
@@ -76,13 +84,44 @@ async function acquireLock() {
   }
 }
 
-export async function refresh() {
+/**
+ * Whether the served data is old enough to be worth rebuilding.
+ *
+ * The container refreshes at boot as well as on the interval, so the decision
+ * has to live here: without it a container restarting more often than the
+ * interval would rebuild the whole slice — and re-read every score from the HN
+ * API — on every restart. Data whose age can't be established is treated as due,
+ * since the alternative is serving unknown-age data forever.
+ */
+export function isDue(metadata, { now = Date.now(), minAgeMs = INTERVAL_MS } = {}) {
+  const refreshedAt = Date.parse(metadata?.refreshedAt ?? '');
+  if (!Number.isFinite(refreshedAt)) return true;
+  const age = now - refreshedAt;
+  return age < 0 || age >= minAgeMs; // a future timestamp is clock skew, not freshness
+}
+
+/** The current data's build metadata, or {} if it has none we can read. */
+async function currentMetadata() {
+  try {
+    return JSON.parse(await readFile(path.join(DATA_LINK, '.metadata.json'), 'utf8'));
+  } catch (e) {
+    if (e?.code !== 'ENOENT') console.error(`[refresh] metadata: ${e?.message || e}`);
+    return {};
+  }
+}
+
+export async function refresh({ force = false, minAgeMs = INTERVAL_MS } = {}) {
+  if (!force && !isDue(await currentMetadata(), { minAgeMs })) {
+    log(`data is newer than ${(minAgeMs / 3600000).toFixed(1)}h — nothing to do`);
+    return { skipped: true };
+  }
   await acquireLock();
   try {
     await runRefresh();
   } finally {
     await rm(LOCK_DIR, { recursive: true, force: true });
   }
+  return { skipped: false };
 }
 
 async function runRefresh() {
@@ -140,8 +179,8 @@ async function runRefresh() {
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 if (import.meta.url === `file://${process.argv[1]}`) {
-  refresh()
-    .then(() => log('done'))
+  refresh({ force: process.argv.includes('--force') })
+    .then(({ skipped }) => log(skipped ? 'skipped' : 'done'))
     .catch((e) => {
       console.error(`[refresh] FAILED (current data left in place): ${e?.message || e}`);
       process.exit(1);
