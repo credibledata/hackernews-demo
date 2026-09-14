@@ -8,6 +8,9 @@
 // Run standalone:  node tests/browser/mock-backend.mjs [port]
 
 import { createServer } from 'node:http';
+// The real module, not a copy: the mock's job is to speak the backend's
+// contract, and follow-ups are part of it.
+import { followUpsFor } from '../../app/server/followups.mjs';
 
 const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 8787);
 
@@ -243,6 +246,7 @@ const server = createServer(async (req, res) => {
     sql: lead.sql,
     data: lead.data,
     interpretation: lead.interpretation,
+    followUps: followUpsFor(lead.detail),
     ...trace,
   });
   send('done', { answer: text });

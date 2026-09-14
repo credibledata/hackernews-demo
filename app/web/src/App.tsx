@@ -280,11 +280,17 @@ export default function App() {
     composer.current?.focus();
   };
 
-  // Starter questions the user hasn't already asked, offered under the newest
-  // answer.
+  // Questions to offer under the newest answer. The backend derives them from
+  // the Malloy that answered, so they follow on from what was just asked; the
+  // starters are the fallback when the query matched nothing in the model.
+  // Either source is filtered against the thread, so a question already asked is
+  // never offered back.
   const asked = new Set(messages.filter((m) => m.role === 'user').map((m) => m.text));
-  const followUps = STARTERS.filter((s) => !asked.has(s)).slice(0, 2);
   const lastMessage = messages.at(-1);
+  const suggested = lastMessage?.result?.followUps?.length
+    ? lastMessage.result.followUps
+    : STARTERS;
+  const followUps = suggested.filter((s) => !asked.has(s)).slice(0, 2);
 
   const linkTo = (question: string) => {
     const url = new URL(location.href);

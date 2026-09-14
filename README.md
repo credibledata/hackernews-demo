@@ -116,6 +116,15 @@ has to pick a score tier and say which). Each answer states the definition it us
 from a second model call — so the point of a semantic layer shows up on the first
 click instead of being explained.
 
+The "Try next" chips under an answer are not fixed: `app/server/followups.mjs`
+maps the query that answered — a named view, or the fields a custom query reached
+for — to two adjacent cuts of the same model, so an answer about the best hour is
+followed by the day-of-week cut and by when comments arrive. It rides the same
+payload as the interpretation line, and for the same reason: a question derived
+from the model can always be answered, where a generated one can ask for
+something this slice does not hold. A query matching nothing falls back to the
+starters.
+
 ## Configuring the data window
 
 `prep/build-data.mjs` reads a configurable lookback window (env vars):

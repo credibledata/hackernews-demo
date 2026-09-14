@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launch, sleep } from './cdp.mjs';
+import { SUGGESTIONS } from '../../app/server/followups.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const WEB_PORT = Number(process.env.HN_TEST_WEB_PORT || 5173);
@@ -19,11 +20,12 @@ const MOCK_PORT = Number(process.env.HN_TEST_MOCK_PORT || 8787);
 const UI = `http://localhost:${WEB_PORT}`;
 const children = [];
 
-// The starter questions are fixed UI copy, not backend-derived — the backend
-// serves no questions at all, so chips that appear can only come from the
-// frontend. Each one leans on a term the Malloy model defines
-// ("best", "perform", "engagement", "successful"), which is the point of the
-// demo: the answer has to say which definition it used.
+// The starter questions are fixed UI copy: the empty state has no answer to
+// follow on from, so its chips can only come from the frontend. Each one leans
+// on a term the Malloy model defines ("best", "perform", "engagement",
+// "successful"), which is the point of the demo: the answer has to say which
+// definition it used. The chips under an answer are the other case — those come
+// from the backend, derived from the query that answered.
 const STARTERS = [
   'When is the best time to post?',
   'Which domains perform best on Hacker News?',
@@ -427,7 +429,7 @@ async function main() {
     );
   });
 
-  await test('follow-up chips appear and exclude the question already asked', async () => {
+  await test('follow-up chips come from the query that answered, not the starters', async () => {
     await page.goto(UI);
     await page.waitFor(`document.querySelectorAll('.empty .chip').length > 0`);
     const target = await page.eval(`
@@ -441,6 +443,10 @@ async function main() {
     assert(chips.length > 0, 'no follow-up chips');
     assert(chips.length <= 2, `follow-ups should offer at most 2, got ${chips.length}`);
     assert(!chips.includes(target), `follow-ups still offer the asked question: ${target}`);
+    // The mock answers every question with `run: stories -> by_category`, so
+    // these are the chips that view earns — not the starter list, which is what
+    // the UI falls back to when the payload carries none.
+    assertEqual(chips.join(' | '), SUGGESTIONS.by_category.join(' | '), 'derived follow-ups');
   });
 
   await test('New chat clears the thread, the URL and refocuses the composer', async () => {
