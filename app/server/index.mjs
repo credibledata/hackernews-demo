@@ -26,7 +26,6 @@ import { getDataset } from './dataset.mjs';
 import { getModelSource } from './model.mjs';
 import { createRateLimiter } from './ratelimit.mjs';
 import { createMetrics } from './metrics.mjs';
-import { createAnswerCache } from './answercache.mjs';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -45,27 +44,6 @@ const limiter = createRateLimiter({
 });
 
 const metrics = createMetrics();
-
-// A handful of questions dominate this demo's traffic: the starter chips and
-// whatever ?q= link gets shared. Caching their answers turns "cost per visitor"
-// into "cost per distinct question".
-const answers = createAnswerCache({
-  ttlMs: Number(process.env.HN_ANSWER_TTL_MS || 60 * 60 * 1000),
-  maxEntries: Number(process.env.HN_ANSWER_CACHE_SIZE || 200),
-});
-
-/** Replay a cached turn as the same SSE sequence a live one produces, so the
- *  client needs no special case. Text goes out in chunks rather than one blob
- *  to keep the answer readable as it lands. The whole trace is stored, so a
- *  replayed answer shows the same work the live run did. */
-function replayCached(send, { answer, ...result }) {
-  const CHUNK = 60;
-  for (let i = 0; i < answer.length; i += CHUNK) {
-    send('token', { text: answer.slice(i, i + CHUNK) });
-  }
-  send('result', { ...result, cached: true });
-  send('done', { answer });
-}
 
 // Bound the replayed history: it is resent on every turn, so an unbounded
 // thread grows cost and latency without improving the answer.
@@ -105,7 +83,7 @@ app.get('/chat/metrics', (req, res) => {
   if (METRICS_TOKEN && req.query.token !== METRICS_TOKEN) {
     return res.status(404).end();
   }
-  res.json({ model: config.model, ...metrics.snapshot(), answer_cache: answers.stats() });
+  res.json({ model: config.model, ...metrics.snapshot() });
 });
 
 // The scope of the slice the questions run against, for the note on the empty
@@ -178,18 +156,7 @@ app.post('/chat/message', async (req, res) => {
     .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
     .map((m) => ({ role: m.role, content: m.content.slice(0, MAX_HISTORY_CHARS) }));
 
-  // Only opening questions are cacheable — a follow-up's answer depends on the
-  // conversation before it, so replaying one out of context would be wrong.
-  const cacheable = trimmed.length === 0;
-
   try {
-    const cached = cacheable ? answers.get(message) : null;
-    if (cached) {
-      replayCached(send, cached);
-      outcome = 'cached';
-      return; // finally still records the outcome and closes the stream
-    }
-
     const mcp = await getMcp();
     // The status events are the live progress line; the trace the agent returns
     // is what the panel is built from once the answer is done.
@@ -238,12 +205,6 @@ app.post('/chat/message', async (req, res) => {
       } else {
         send('done', { answer });
         outcome = 'completed';
-
-        // Cache only a complete, grounded answer: one that finished and actually
-        // ran a query. A prose-only reply has nothing to show under the hood.
-        if (cacheable && result) {
-          answers.set(message, { answer, ...result });
-        }
       }
     }
   } catch (e) {
@@ -258,7 +219,6 @@ app.post('/chat/message', async (req, res) => {
     // in-flight gauge — including the ones that never reach the catch.
     const ms = Date.now() - startedAt;
     if (outcome === 'completed') metrics.completed(ms);
-    else if (outcome === 'cached') metrics.servedFromCache();
     else if (outcome === 'error') metrics.errored();
     else metrics.abortedRequest();
 

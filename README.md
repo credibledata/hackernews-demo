@@ -325,24 +325,16 @@ balancer**, every request arrives from the balancer's address and these become
 global limits — configure nginx's `real_ip` module with your balancer's range
 first.
 
-Answers to opening questions are cached and replayed, which matters more than it
-sounds: nearly every first-time visitor clicks one of the same four starter
-chips, and a shared `?q=` link re-asks the same question for everyone who opens
-it. Without the cache each of those is a fresh model turn, so cost scales with
-visitors rather than with distinct questions. Follow-ups are never cached — the
-answer depends on the conversation before it — and the UI marks a replayed
-answer `cached` on the "how this was computed" card.
+Every question runs the agent. Nothing is replayed from a previous turn, so the
+same question asked twice costs two model turns — the rate limits above are what
+bounds spend.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `HN_ANSWER_TTL_MS` | `3600000` | How long a cached answer stays valid (1h) |
-| `HN_ANSWER_CACHE_SIZE` | `200` | Distinct questions kept |
 | `HN_METRICS_TOKEN` | unset | If set, `/chat/metrics` requires `?token=` |
 
-`/chat/metrics` returns counters, cache hit rate, and answer latency (p50/p95)
-as JSON — enough to tell whether the demo is actually serving during a traffic
-spike. Cached replays are counted separately and excluded from the latency
-window, so the percentiles still describe what a real answer costs.
+`/chat/metrics` returns counters and answer latency (p50/p95) as JSON — enough
+to tell whether the demo is actually serving during a traffic spike.
 
 The chat UI reads one optional build-time var, `VITE_EXPLORER_URL`. Set it to a
 separately-exposed Publisher and each answer gets an "Open in Explorer" link.
@@ -352,7 +344,7 @@ from paths that collide with the UI's.
 ## Tests
 
 ```bash
-npm test            # hermetic: prep ETL, rate limiter, metrics, answer cache
+npm test            # hermetic: prep ETL, rate limiter, metrics, trace
 npm run test:browser # drives the real UI in headless Chrome against a mock backend
 ```
 
@@ -396,7 +388,6 @@ prep/build-data.mjs Node + DuckDB ETL (Hugging Face → curated Parquet)
 app/server          chat backend (MCP client + OpenAI tool loop, SSE)
   ratelimit.mjs     per-IP token bucket + global in-flight cap
   metrics.mjs       counters and answer-latency percentiles
-  answercache.mjs   TTL+LRU replay of answers to repeated opening questions
   trace.mjs         the "under the hood" trace: the agent's steps, with each
                     query re-run over REST for its SQL and rows
   interpretation.mjs "Interpreted as:" line, derived from the Malloy that ran

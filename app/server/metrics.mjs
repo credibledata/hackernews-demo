@@ -23,7 +23,6 @@ export function createMetrics({
   const counters = {
     messages_started: 0,
     answers_completed: 0,
-    served_from_cache: 0,
     errors: 0,
     aborted: 0,
   };
@@ -48,13 +47,6 @@ export function createMetrics({
       endOne();
       samples[written % sampleSize] = ms;
       written += 1;
-    },
-    /** A cache hit: a real answer served without a model turn. Deliberately
-     *  kept out of the latency window, which is there to show what a live
-     *  answer costs — mixing in millisecond replays would flatter it. */
-    servedFromCache() {
-      counters.served_from_cache += 1;
-      endOne();
     },
     errored() {
       counters.errors += 1;

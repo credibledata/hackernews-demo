@@ -29,9 +29,6 @@ export type UnderTheHood = {
   // repeat — the result the chart and the CSV download are built from.
   steps: Step[];
   primary: number;
-  // True when the backend replayed a previously computed answer for this
-  // question rather than running the agent again.
-  cached?: boolean;
   // Deterministic explanation of the governed semantics used by the query.
   interpretation?: string;
   // Two questions adjacent to this query in the model, for the "Try next" row.
