@@ -35,14 +35,13 @@ export const stepLabel = (kind: string, detail: string) =>
 type Props = {
   steps: Step[];
   primary: number;
-  cached?: boolean;
 };
 
-export function UnderTheHood({ steps, primary, cached }: Props) {
+export function UnderTheHood({ steps, primary }: Props) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<'malloy' | 'sql' | 'data'>('malloy');
   // Which step's work is on show. Starts on the result the answer rests on; a
-  // later `result` event (a retry, a cached replay) re-pins it there.
+  // later `result` event (a retry) re-pins it there.
   const [selected, setSelected] = useState(primary);
   useEffect(() => setSelected(primary), [primary, steps]);
 
@@ -84,11 +83,6 @@ export function UnderTheHood({ steps, primary, cached }: Props) {
             {steps.length} step{steps.length === 1 ? '' : 's'}
           </span>
         )}
-        {cached && (
-          <span className="hood-badge" title="Replayed from a previous run of this exact question">
-            cached
-          </span>
-        )}
       </button>
 
       {open && (
@@ -125,13 +119,6 @@ export function UnderTheHood({ steps, primary, cached }: Props) {
               );
             })}
           </ol>
-          {cached && (
-            <p className="hood-note hood-cached-note">
-              This exact question was asked before, so the saved answer and its queries were
-              replayed instead of running the agent again.
-            </p>
-          )}
-
           <div className="hood-tabs" role="tablist">
             {tabs.map((t) => (
               <button

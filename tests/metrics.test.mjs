@@ -44,31 +44,15 @@ test('counters track each outcome independently', () => {
 test('in-flight rises on start and falls on every terminal outcome', () => {
   const m = createMetrics();
 
-  m.started(); m.started(); m.started(); m.started();
-  assert.equal(m.snapshot().in_flight, 4);
+  m.started(); m.started(); m.started();
+  assert.equal(m.snapshot().in_flight, 3);
 
   m.completed(50);
-  assert.equal(m.snapshot().in_flight, 3);
-  m.errored();
   assert.equal(m.snapshot().in_flight, 2);
-  m.abortedRequest();
+  m.errored();
   assert.equal(m.snapshot().in_flight, 1);
-  m.servedFromCache();
-  assert.equal(m.snapshot().in_flight, 0, 'a cache hit is a terminal outcome too');
-});
-
-test('cache hits are counted but excluded from answer latency', () => {
-  const m = createMetrics();
-  m.started();
-  m.completed(5000);
-  m.started();
-  m.servedFromCache();
-
-  const s = m.snapshot();
-  assert.equal(s.answers_completed, 1);
-  assert.equal(s.served_from_cache, 1);
-  assert.equal(s.latency_ms.count, 1, 'only the live answer is sampled');
-  assert.equal(s.latency_ms.p50, 5000);
+  m.abortedRequest();
+  assert.equal(m.snapshot().in_flight, 0);
 });
 
 test('in-flight never goes negative if outcomes outnumber starts', () => {

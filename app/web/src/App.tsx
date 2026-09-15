@@ -415,11 +415,7 @@ export default function App() {
               {m.result?.data != null && <ChartCard data={m.result.data} />}
 
               {m.result?.steps?.length ? (
-                <UnderTheHood
-                  steps={m.result.steps}
-                  primary={m.result.primary}
-                  cached={m.result.cached}
-                />
+                <UnderTheHood steps={m.result.steps} primary={m.result.primary} />
               ) : null}
 
               {m.role === 'assistant' && !m.streaming && m.question && !m.error && (
